@@ -1,0 +1,17 @@
+{
+    "an": {
+        "salt": "63f5181c3b74cad676dae7129a92356d",
+        "hash": "259cd8b0f898ef96539c3c4c34385e8b815affd72156de0d54bdb3bcbe49294d",
+        "iterations": 200000
+    },
+    "binh": {
+        "salt": "8a9c9c26287e58b442dbb04d0e49219c",
+        "hash": "25ea631ee6caf13943dc374d5233634a91ef641a87f8193dc64c189d9e612020",
+        "iterations": 200000
+    },
+    "chi": {
+        "salt": "288f2a93fe7e87268bc9362086632bd9",
+        "hash": "6b82ed9a83cc1a8c9b701fbafadb1ff63e66c9e99bd888358e16ee9cabb5a6ba",
+        "iterations": 200000
+    }
+}

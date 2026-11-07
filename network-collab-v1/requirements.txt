@@ -1,0 +1,3 @@
+# Chưa cần thư viện bên thứ ba cho demo framing và tests hiện tại.
+# Khi triển khai AES-GCM ở UDP, cài thư viện cryptography phiên bản phù hợp.
+# cryptography
