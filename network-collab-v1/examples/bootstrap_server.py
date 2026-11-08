@@ -26,7 +26,7 @@ def main() -> None:
     args = parser.parse_args()
 
     ctx = server_context(args.cert, args.key)
-    registry = SessionRegistry(bootstrap_timeout_s=10.0, idle_timeout_s=15.0)
+    registry = SessionRegistry(bootstrap_timeout_s=10.0, idle_timeout_s=10.0)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -34,12 +34,13 @@ def main() -> None:
         listener.listen(20)
         listener.settimeout(0.5)  # Thoát accept định kỳ để dọn phiên hết hạn.
         print(f"[BOOTSTRAP] TLS server tại {args.host}:{args.port}", flush=True)
-        print("[BOOTSTRAP] A1.4 quản lý session; UDP chưa kết nối", flush=True)
+        print("[BOOTSTRAP] A1.4+ quản lý session và sự kiện cleanup; UDP chưa kết nối", flush=True)
         print("[BOOTSTRAP] Nhấn Ctrl+C để dừng", flush=True)
         try:
             while True:
-                for conn_id in registry.cleanup_expired():
-                    print(f"[SESSION] EXPIRED {conn_id:016x}", flush=True)
+                registry.cleanup_expired()
+                for event in registry.drain_closed_events():
+                    print(f"[SESSION] CLOSED conn_id={event.conn_id:016x} reason={event.reason}", flush=True)
                 try:
                     raw, peer = listener.accept()
                 except socket.timeout:

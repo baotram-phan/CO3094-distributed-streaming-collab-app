@@ -131,3 +131,19 @@ Server dự kiến ghi log `BOOTSTRAPPED`, `conn_id`, `pending=...`, rồi `EXPI
 ## 6. Việc cần làm tiếp
 
 **Ưu tiên số 1:** A và B thống nhất UDP packet format, khóa/nonce/AAD, callback của `SessionRegistry`, thứ tự `REGISTER → REGISTER_OK → AUTH → AUTH_OK` và heartbeat/timeout. Sau đó tích hợp **A1.5 — UDP Registration**. Khi liên kết A/B chạy được, tiếp tục UDP Authentication, messaging và file transfer, trong khi A phát triển CUBIC/simulator và UI.
+A1.4.5 — Patch bo sung SessionRegistry chuan bi A1.5
+
+Noi dung:
+  server/sessions.py                   THAY THE
+  tests/test_sessions.py               THAY THE (13 tests cu + 11 tests moi)
+  examples/bootstrap_server.py         THAY THE (idle=10, log close event)
+  docs/A1_4_5_IMPLEMENTATION_GUIDE.md  MOI
+
+Giu nguyen server/auth.py, config/users.json, TLS certs, B UDP code.
+
+PowerShell tu thu muc goc network-collab-v1:
+  python -m unittest tests.test_sessions -v
+  python -m unittest discover -s tests -v
+
+Da kiem thu khi ghep project goc A1.3 + A1.4: 40 tests PASS.
+A1.5 UDP REGISTER that CHUA DUOC trien khai trong patch.

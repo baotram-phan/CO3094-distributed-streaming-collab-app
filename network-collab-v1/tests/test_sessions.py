@@ -30,7 +30,7 @@ class TestSessionRegistry(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock()
         self.registry = SessionRegistry(
-            bootstrap_timeout_s=10, idle_timeout_s=15, clock=self.clock,
+            bootstrap_timeout_s=10, idle_timeout_s=10, clock=self.clock,
             password_verifier=lambda user, password: password == "ok" and user in {"an", "binh"},
         )
 
@@ -103,9 +103,9 @@ class TestSessionRegistry(unittest.TestCase):
         endpoint = ("127.0.0.1", 53000)
         self.registry.bind_udp_verified(s.conn_id, endpoint)
         self.registry.authenticate_after_verified_udp(s.conn_id, "an", "ok")
-        self.clock.advance(14)
-        self.registry.bind_udp_verified(s.conn_id, endpoint)  # datagram đã xác thực
-        self.clock.advance(14)
+        self.clock.advance(9)
+        self.registry.touch_verified_udp(s.conn_id, endpoint)  # datagram đã xác thực
+        self.clock.advance(9)
         self.assertEqual(self.registry.list_online_users(), ["an"])
         self.clock.advance(1)
         self.assertEqual(self.registry.cleanup_expired(), [s.conn_id])
@@ -135,6 +135,198 @@ class TestSessionRegistry(unittest.TestCase):
         s = self.new_session()
         with self.assertRaises(ValueError):
             self.registry.bind_udp_verified(s.conn_id, ("127.0.0.1", 0))
+
+
+class TestSessionRegistryIntegrationContract(unittest.TestCase):
+    """A1.4+ contract tests. Fake clock avoids waiting 10/30 seconds."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.registry = SessionRegistry(
+            clock=self.clock,
+            password_verifier=lambda user, password: user == "an" and password == "ok",
+        )
+        self.endpoint = ("127.0.0.1", 53000)
+
+    def new_session(self):
+        return self.registry.create_bootstrap(
+            tcp_ip="127.0.0.1", c2s_key=b"a" * 32, s2c_key=b"b" * 32,
+        )
+
+    def test_defaults_are_ten_and_thirty_seconds(self):
+        self.assertEqual(self.registry.bootstrap_timeout_s, 10)
+        self.assertEqual(self.registry.idle_timeout_s, 10)
+        self.assertEqual(self.registry.auth_timeout_s, 30)
+
+    def test_first_register_and_repeat_register_keep_original_auth_deadline(self):
+        s = self.new_session()
+        first = self.registry.bind_udp_verified(s.conn_id, self.endpoint)
+        self.assertEqual(first.state, SessionState.UDP_BOUND)
+        self.assertEqual(first.udp_bound_at, self.clock.current)
+        self.clock.advance(7)
+        repeated = self.registry.bind_udp_verified(s.conn_id, self.endpoint)
+        self.assertEqual(repeated.udp_bound_at, first.udp_bound_at)
+        self.assertEqual(repeated.last_activity_at, self.clock.current)
+        self.assertEqual(len(self.registry), 1)
+        self.assertEqual(self.registry.list_online_users(), [])
+
+    def test_touch_forbidden_before_register(self):
+        s = self.new_session()
+        with self.assertRaises(InvalidTransition):
+            self.registry.touch_verified_udp(s.conn_id, self.endpoint)
+        self.assertEqual(self.registry.get(s.conn_id).state, SessionState.BOOTSTRAPPED)
+
+    def test_touch_updates_activity_only_for_bound_endpoint(self):
+        s = self.new_session()
+        bound = self.registry.bind_udp_verified(s.conn_id, self.endpoint)
+        self.clock.advance(9)
+        updated = self.registry.touch_verified_udp(s.conn_id, self.endpoint)
+        self.assertEqual(updated.udp_bound_at, bound.udp_bound_at)
+        self.assertEqual(updated.state, SessionState.UDP_BOUND)
+        self.assertEqual(updated.last_activity_at, self.clock.current)
+        self.assertEqual(updated.udp_endpoint, self.endpoint)
+
+    def test_touch_rejects_endpoint_change_and_invalid_port(self):
+        s = self.new_session()
+        self.registry.bind_udp_verified(s.conn_id, self.endpoint)
+        with self.assertRaises(EndpointChanged):
+            self.registry.touch_verified_udp(s.conn_id, ("127.0.0.1", 53001))
+        with self.assertRaises(ValueError):
+            self.registry.touch_verified_udp(s.conn_id, ("127.0.0.1", 0))
+        self.assertEqual(self.registry.get(s.conn_id).last_activity_at, s.created_at)
+
+    def test_online_idle_timeout_is_ten_seconds(self):
+        s = self.new_session()
+        self.registry.bind_udp_verified(s.conn_id, self.endpoint)
+        self.assertTrue(self.registry.authenticate_after_verified_udp(s.conn_id, "an", "ok"))
+        self.clock.advance(9)
+        self.assertEqual(self.registry.list_online_users(), ["an"])
+        self.clock.advance(1)
+        self.assertEqual(self.registry.cleanup_expired(), [s.conn_id])
+        self.assertEqual(self.registry.list_online_users(), [])
+        events = self.registry.drain_closed_events()
+        self.assertEqual([(e.conn_id, e.reason, e.username) for e in events],
+                         [(s.conn_id, "idle_timeout", "an")])
+
+    def test_heartbeat_cannot_extend_auth_deadline(self):
+        s = self.new_session()
+        self.registry.bind_udp_verified(s.conn_id, self.endpoint)
+        for _ in range(4):
+            self.clock.advance(7)
+            self.registry.touch_verified_udp(s.conn_id, self.endpoint)
+        self.clock.advance(2)  # 30s since first REGISTER, only 2s idle
+        with self.assertRaises(SessionExpired):
+            self.registry.touch_verified_udp(s.conn_id, self.endpoint)
+        self.assertEqual(self.registry.drain_closed_events()[0].reason, "auth_timeout")
+
+    def test_duplicate_register_cannot_extend_auth_deadline(self):
+        s = self.new_session()
+        first = self.registry.bind_udp_verified(s.conn_id, self.endpoint)
+        for _ in range(4):
+            self.clock.advance(7)
+            next_snapshot = self.registry.bind_udp_verified(s.conn_id, self.endpoint)
+            self.assertEqual(next_snapshot.udp_bound_at, first.udp_bound_at)
+        self.clock.advance(2)
+        self.assertEqual(self.registry.cleanup_expired(), [s.conn_id])
+        self.assertEqual(self.registry.drain_closed_events()[0].reason, "auth_timeout")
+
+    def test_successful_auth_removes_auth_deadline_but_not_idle_deadline(self):
+        s = self.new_session()
+        self.registry.bind_udp_verified(s.conn_id, self.endpoint)
+        self.clock.advance(8)
+        self.registry.touch_verified_udp(s.conn_id, self.endpoint)
+        self.assertTrue(self.registry.authenticate_after_verified_udp(s.conn_id, "an", "ok"))
+        for _ in range(4):
+            self.clock.advance(8)
+            self.registry.touch_verified_udp(s.conn_id, self.endpoint)
+        self.assertEqual(self.registry.get(s.conn_id).state, SessionState.ONLINE)
+        self.assertGreater(self.clock.current - s.created_at, 30)
+
+    def test_get_implicit_expiration_emits_single_cleanup_event(self):
+        s = self.new_session()
+        self.clock.advance(10)
+        self.assertIsNone(self.registry.get(s.conn_id))  # old A1.4 silently removed
+        events = self.registry.drain_closed_events()
+        self.assertEqual([(e.conn_id, e.reason) for e in events],
+                         [(s.conn_id, "bootstrap_timeout")])
+        self.assertIsNone(self.registry.get(s.conn_id))
+        self.assertEqual(self.registry.drain_closed_events(), [])
+
+    def test_close_emits_event_once_and_is_idempotent(self):
+        s = self.new_session()
+        self.assertTrue(self.registry.close(s.conn_id, reason="logout"))
+        self.assertFalse(self.registry.close(s.conn_id, reason="logout"))
+        events = self.registry.drain_closed_events()
+        self.assertEqual([(e.conn_id, e.reason) for e in events],
+                         [(s.conn_id, "logout")])
+        self.assertEqual(self.registry.drain_closed_events(), [])
+
+
+class TestUDPBindResultContract(unittest.TestCase):
+    """A/B integration tests: atomic newly_bound, no deadline reset, cleanup."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.registry = SessionRegistry(clock=self.clock,
+                                        password_verifier=lambda u, p: u == "an" and p == "ok")
+        self.endpoint = ("127.0.0.1", 53000)
+        self.session = self.registry.create_bootstrap(
+            tcp_ip="127.0.0.1", c2s_key=b"A" * 32, s2c_key=b"B" * 32)
+
+    def test_newly_bound_true_once_then_false_on_repeat(self):
+        first = self.registry.bind_udp_verified_with_status(self.session.conn_id, self.endpoint)
+        self.assertTrue(first.newly_bound)
+        self.assertEqual(first.session.state, SessionState.UDP_BOUND)
+        self.clock.advance(3)
+        repeat = self.registry.bind_udp_verified_with_status(self.session.conn_id, self.endpoint)
+        self.assertFalse(repeat.newly_bound)
+        self.assertEqual(repeat.session.udp_bound_at, first.session.udp_bound_at)
+        self.assertEqual(len(self.registry), 1)
+        self.assertEqual(self.registry.list_online_users(), [])
+
+    def test_repeat_register_during_online_does_not_revert_state(self):
+        self.registry.bind_udp_verified_with_status(self.session.conn_id, self.endpoint)
+        self.registry.authenticate_after_verified_udp(self.session.conn_id, "an", "ok")
+        repeat = self.registry.bind_udp_verified_with_status(self.session.conn_id, self.endpoint)
+        self.assertFalse(repeat.newly_bound)
+        self.assertEqual(repeat.session.state, SessionState.ONLINE)
+        self.assertEqual(self.registry.list_online_users(), ["an"])
+
+    def test_rejected_endpoint_does_not_change_session(self):
+        first = self.registry.bind_udp_verified_with_status(self.session.conn_id, self.endpoint)
+        with self.assertRaises(EndpointChanged):
+            self.registry.bind_udp_verified_with_status(self.session.conn_id, ("127.0.0.1", 53001))
+        self.assertEqual(self.registry.get(self.session.conn_id), first.session)
+
+    def test_concurrent_register_calls_exactly_one_newly_bound(self):
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: self.registry.bind_udp_verified_with_status(
+                self.session.conn_id, self.endpoint), range(20)))
+        self.assertEqual(sum(result.newly_bound for result in results), 1)
+        self.assertEqual(len(self.registry), 1)
+
+    def test_legacy_bind_returns_session_and_new_method_is_compatible(self):
+        old = self.registry.bind_udp_verified(self.session.conn_id, self.endpoint)
+        self.assertEqual(old.state, SessionState.UDP_BOUND)
+        self.assertFalse(self.registry.bind_udp_verified_with_status(
+            self.session.conn_id, self.endpoint).newly_bound)
+
+    def test_touch_does_not_reset_auth_deadline(self):
+        first = self.registry.bind_udp_verified_with_status(self.session.conn_id, self.endpoint)
+        for _ in range(3):
+            self.clock.advance(8)
+            refreshed = self.registry.touch_verified_udp(self.session.conn_id, self.endpoint)
+            self.assertEqual(refreshed.udp_bound_at, first.session.udp_bound_at)
+        self.clock.advance(6)
+        self.assertEqual(self.registry.cleanup_expired(), [self.session.conn_id])
+        self.assertEqual(self.registry.drain_closed_events()[0].reason, "auth_timeout")
+
+    def test_cleanup_event_once_on_expired_get(self):
+        self.clock.advance(10)
+        self.assertIsNone(self.registry.get(self.session.conn_id))
+        self.assertEqual([(e.conn_id, e.reason) for e in self.registry.drain_closed_events()],
+                         [(self.session.conn_id, "bootstrap_timeout")])
+        self.assertEqual(self.registry.drain_closed_events(), [])
 
 
 class BufferSocket:

@@ -1,19 +1,15 @@
-"""A1.4 — phiên kết nối trên server (chưa tự mở UDP socket).
+"""A1.4+ — Server-side session registry for integration with verified UDP.
 
-Luồng: BOOTSTRAPPED -> UDP_BOUND -> ONLINE -> CLOSED.
+Security boundary:
+  - B checks AES-GCM, anti-replay, packet format BEFORE bind/touch.
+  - A is the only owner of usernames, login, ONLINE and session lifetime.
+  - Session is an immutable snapshot. Do not mutate fields after get().
 
-Ranh giới bảo mật rất quan trọng:
-- bind_udp_verified() CHỈ được gọi sau khi tầng UDP của B xác thực AES-GCM,
-  kiểm tra packet number/anti-replay và biết chính xác conn_id hợp lệ.
-- authenticate_after_verified_udp() CHỈ được gọi với nội dung AUTH được giải mã,
-  xác thực qua UDP; hàm tự kiểm tra password thực tế.
-- Chỉ biết ConnID hoặc địa chỉ IP/port KHÔNG đủ để đăng ký/đăng nhập.
-
-Các bản ghi Session bất biến (frozen) để caller không vô tình sửa registry.
-RLock cho phép nhiều thread cùng thêm/đọc/đóng phiên.
+No real UDP sockets are used in this module.
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field, replace
 from enum import Enum
 import secrets
@@ -32,7 +28,7 @@ class SessionState(str, Enum):
 
 
 class SessionError(ValueError):
-    """Hành động không hợp lệ đối với phiên."""
+    """A session operation is not allowed."""
 
 
 class UnknownSession(SessionError):
@@ -66,38 +62,73 @@ class Session:
     username: str | None = None
     created_at: float = 0.0
     last_activity_at: float = 0.0
+    # First successful UDP REGISTER. NEVER refresh for repeat REGISTER or PING.
+    udp_bound_at: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UDPBindResult:
+    """Result of an atomic, verified REGISTER bind.
+
+    newly_bound is True only for the FIRST successful BOOTSTRAPPED -> UDP_BOUND
+    transition. Duplicate valid REGISTERs from the same endpoint yield False.
+    Transport B uses this flag to emit on_udp_registered exactly once.
+    """
+    session: Session
+    newly_bound: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SessionClosedEvent:
+    """Notification for B to dispose transport state, without secret keys."""
+    conn_id: int
+    reason: str
+    username: str | None = None
 
 
 class SessionRegistry:
-    """Kho phiên trong RAM. Không có network I/O; có thể unit-test độc lập.
+    """Thread-safe state machine; no networking or crypto inside.
 
-    Tham số `clock` hỗ trợ test thời gian không cần sleep().
-    `password_verifier` mặc định dùng server.auth.verify_password().
+    After any operation that may close sessions, the application can call
+    drain_closed_events() and ask B to remove the associated transport state.
+    Never hold a transport lock while calling registry methods (or vice versa).
     """
 
     def __init__(
         self,
         *,
         bootstrap_timeout_s: float = 10.0,
-        idle_timeout_s: float = 15.0,
+        idle_timeout_s: float = 10.0,
+        auth_timeout_s: float = 30.0,
         clock: Callable[[], float] = time.monotonic,
         password_verifier: Callable[[str, str], bool] = verify_password,
     ) -> None:
-        if bootstrap_timeout_s <= 0 or idle_timeout_s <= 0:
+        if min(bootstrap_timeout_s, idle_timeout_s, auth_timeout_s) <= 0:
             raise ValueError("Timeout phải lớn hơn 0")
         self.bootstrap_timeout_s = float(bootstrap_timeout_s)
         self.idle_timeout_s = float(idle_timeout_s)
+        self.auth_timeout_s = float(auth_timeout_s)
         self._clock = clock
         self._check_password = password_verifier
         self._sessions: dict[int, Session] = {}
         self._online_by_user: dict[str, int] = {}
+        self._closed_events: deque[SessionClosedEvent] = deque()
         self._lock = threading.RLock()
 
-    def create_bootstrap(self, *, tcp_ip: str, c2s_key: bytes, s2c_key: bytes) -> Session:
-        """Đặt phiên BOOTSTRAPPED vào registry TRƯỚC khi gửi HELLO_ACK.
+    @staticmethod
+    def _validate_endpoint(endpoint: tuple[str, int]) -> None:
+        if (
+            not isinstance(endpoint, tuple)
+            or len(endpoint) != 2
+            or not isinstance(endpoint[0], str)
+            or not endpoint[0]
+            or type(endpoint[1]) is not int
+            or not 1 <= endpoint[1] <= 65535
+        ):
+            raise ValueError("Endpoint phải là (ip, port) hợp lệ")
 
-        Nhờ đó gói UDP đầu tiên không thể tới trước khi server ghi nhận ConnID.
-        """
+    def create_bootstrap(self, *, tcp_ip: str, c2s_key: bytes, s2c_key: bytes) -> Session:
+        """Store session BEFORE HELLO_ACK, while it is still BOOTSTRAPPED."""
         if not isinstance(tcp_ip, str) or not tcp_ip:
             raise ValueError("Thiếu TCP peer IP")
         if not isinstance(c2s_key, bytes) or not isinstance(s2c_key, bytes):
@@ -125,55 +156,92 @@ class SessionRegistry:
             return session
 
     def get(self, conn_id: int) -> Session | None:
-        """Lấy snapshot phiên còn hiệu lực; không trả khóa qua log/UI."""
+        """Return a snapshot or None. Expiry also emits a close event."""
         with self._lock:
             self._cleanup_expired_locked(self._clock())
             return self._sessions.get(conn_id)
 
     def bind_udp_verified(self, conn_id: int, endpoint: tuple[str, int]) -> Session:
-        """RANH GIỚI TIN CẬY: chỉ UDP transport đã verify AEAD/anti-replay được gọi.
+        """Backward-compatible REGISTER API returning only Session.
 
-        Lần đầu BOOTSTRAPPED -> UDP_BOUND. Những gói đã xác thực tiếp theo cập nhật
-        last_activity. Không tự động cho phép chuyển UDP endpoint giữa chừng.
+        New UDP code should prefer bind_udp_verified_with_status() to obtain an
+        atomic newly_bound flag. Both methods enforce the same validations.
         """
-        if (not isinstance(endpoint, tuple) or len(endpoint) != 2
-                or not isinstance(endpoint[0], str) or not endpoint[0]
-                or type(endpoint[1]) is not int or not 1 <= endpoint[1] <= 65535):
-            raise ValueError("Endpoint phải là (ip, port) hợp lệ")
+        return self.bind_udp_verified_with_status(conn_id, endpoint).session
+
+    def bind_udp_verified_with_status(
+        self, conn_id: int, endpoint: tuple[str, int]
+    ) -> UDPBindResult:
+        """B calls AFTER AEAD verification and non-replay check (not commit).
+
+        First REGISTER binds endpoint and returns newly_bound=True.
+        Repeated REGISTERs from the SAME endpoint (with new authenticated
+        packet numbers) return newly_bound=False; session is not recreated,
+        state/udp_bound_at are not reset, ONLINE stays ONLINE.
+
+        The check and update happen atomically under SessionRegistry's lock,
+        avoiding a get()->bind() race between concurrent REGISTERs. B commits
+        packet_number to its replay window ONLY after this call succeeds.
+        """
+        self._validate_endpoint(endpoint)
         with self._lock:
             session = self._require_active_locked(conn_id)
             if session.udp_endpoint is not None and session.udp_endpoint != endpoint:
-                raise EndpointChanged("Đổi UDP endpoint cần flow rebind được xác thực riêng")
-            state = SessionState.UDP_BOUND if session.state is SessionState.BOOTSTRAPPED else session.state
-            updated = replace(session, udp_endpoint=endpoint, state=state,
-                              last_activity_at=self._clock())
+                raise EndpointChanged("UDP endpoint changed; bootstrap again")
+            if session.state not in (
+                SessionState.BOOTSTRAPPED, SessionState.UDP_BOUND, SessionState.ONLINE
+            ):
+                raise InvalidTransition("REGISTER không hợp lệ ở trạng thái này")
+            now = self._clock()
+            newly_bound = session.state is SessionState.BOOTSTRAPPED
+            updated = replace(
+                session,
+                udp_endpoint=endpoint,
+                state=SessionState.UDP_BOUND if newly_bound else session.state,
+                last_activity_at=now,
+                udp_bound_at=now if newly_bound else session.udp_bound_at,
+            )
+            self._sessions[conn_id] = updated
+            return UDPBindResult(session=updated, newly_bound=newly_bound)
+
+    def touch_verified_udp(self, conn_id: int, endpoint: tuple[str, int]) -> Session:
+        """Refresh activity for a verified, non-replayed datagram from bound endpoint.
+
+        Does not bind a new endpoint, change authentication state, or reset AUTH
+        deadline. This method does NOT validate AES-GCM itself.
+        """
+        self._validate_endpoint(endpoint)
+        with self._lock:
+            session = self._require_active_locked(conn_id)
+            if session.state not in (SessionState.UDP_BOUND, SessionState.ONLINE):
+                raise InvalidTransition("Chưa REGISTER; không thể touch UDP")
+            if session.udp_endpoint != endpoint:
+                raise EndpointChanged("UDP endpoint khác endpoint đã đăng ký")
+            updated = replace(session, last_activity_at=self._clock())
             self._sessions[conn_id] = updated
             return updated
 
     def authenticate_after_verified_udp(self, conn_id: int, username: str, password: str) -> bool:
-        """Kiểm tra mật khẩu thật; chỉ sau khi UDP đã bind + AUTH đã xác thực AEAD.
-
-        True: BOOTSTRAPPED -> UDP_BOUND -> ONLINE hợp lệ.
-        False: sai thông tin đăng nhập; vẫn UDP_BOUND.
-        Tránh giữ lock trong lúc PBKDF2 (có thể chậm).
-        """
+        """A only: password check after B delivers verified AUTH from control stream."""
         if not isinstance(username, str) or not username or not isinstance(password, str):
             return False
         with self._lock:
             session = self._require_active_locked(conn_id)
             if session.state is not SessionState.UDP_BOUND:
                 raise InvalidTransition("AUTH chỉ được phép từ UDP_BOUND")
+        # Expensive PBKDF2 does not run under the registry lock.
         if not self._check_password(username, password):
             return False
         with self._lock:
+            # Re-check: session could have expired/closed while PBKDF2 ran.
             session = self._require_active_locked(conn_id)
             if session.state is not SessionState.UDP_BOUND:
                 raise InvalidTransition("Phiên thay đổi trong khi kiểm tra mật khẩu")
             existing = self._online_by_user.get(username)
             if existing is not None and existing != conn_id:
                 raise DuplicateLogin("Username đang online trong một phiên khác")
-            updated = replace(session, state=SessionState.ONLINE,
-                              username=username, last_activity_at=self._clock())
+            updated = replace(session, state=SessionState.ONLINE, username=username,
+                              last_activity_at=self._clock())
             self._sessions[conn_id] = updated
             self._online_by_user[username] = conn_id
             return True
@@ -189,18 +257,25 @@ class SessionRegistry:
             conn_id = self._online_by_user.get(username)
             return self._sessions.get(conn_id) if conn_id is not None else None
 
-    def close(self, conn_id: int) -> bool:
-        """Đóng và xóa phiên; trả False nếu phiên không tồn tại."""
+    def close(self, conn_id: int, *, reason: str = "closed") -> bool:
+        """Close and notify transport cleanup; idempotent for unknown conn_id."""
         with self._lock:
             if conn_id not in self._sessions:
                 return False
-            self._remove_locked(conn_id)
+            self._remove_locked(conn_id, reason=reason)
             return True
 
     def cleanup_expired(self) -> list[int]:
-        """Xóa bootstrap chưa đăng ký và phiên UDP im lặng quá lâu."""
+        """Close timed-out sessions; return IDs for compatibility with A1.4."""
         with self._lock:
             return self._cleanup_expired_locked(self._clock())
+
+    def drain_closed_events(self) -> list[SessionClosedEvent]:
+        """Atomically drain notifications; call B cleanup OUTSIDE registry locks."""
+        with self._lock:
+            events = list(self._closed_events)
+            self._closed_events.clear()
+            return events
 
     def __len__(self) -> int:
         with self._lock:
@@ -208,29 +283,40 @@ class SessionRegistry:
             return len(self._sessions)
 
     def _require_active_locked(self, conn_id: int) -> Session:
-        now = self._clock()
         session = self._sessions.get(conn_id)
         if session is None:
             raise UnknownSession("ConnID không tồn tại")
-        if self._expired(session, now):
-            self._remove_locked(conn_id)
+        reason = self._expiry_reason(session, self._clock())
+        if reason is not None:
+            self._remove_locked(conn_id, reason=reason)
             raise SessionExpired("Phiên đã hết hạn")
         return session
 
-    def _expired(self, session: Session, now: float) -> bool:
+    def _expiry_reason(self, session: Session, now: float) -> str | None:
         if session.state is SessionState.BOOTSTRAPPED:
-            return (now - session.created_at) >= self.bootstrap_timeout_s
-        return (now - session.last_activity_at) >= self.idle_timeout_s
+            return "bootstrap_timeout" if now - session.created_at >= self.bootstrap_timeout_s else None
+        if session.state is SessionState.UDP_BOUND:
+            # AUTH deadline is independent of keepalive and duplicate REGISTER.
+            if session.udp_bound_at is None:
+                return "invalid_unbound_session"
+            if now - session.udp_bound_at >= self.auth_timeout_s:
+                return "auth_timeout"
+        if now - session.last_activity_at >= self.idle_timeout_s:
+            return "idle_timeout"
+        return None
 
-    def _remove_locked(self, conn_id: int) -> None:
+    def _remove_locked(self, conn_id: int, *, reason: str) -> None:
         session = self._sessions.pop(conn_id)
         if session.username and self._online_by_user.get(session.username) == conn_id:
             del self._online_by_user[session.username]
-        # CLOSED là trạng thái logic sau khi xóa, không giữ key trong registry.
+        # Event deliberately contains no c2s_key/s2c_key.
+        self._closed_events.append(SessionClosedEvent(conn_id, reason, session.username))
 
     def _cleanup_expired_locked(self, now: float) -> list[int]:
-        expired = [conn_id for conn_id, session in self._sessions.items()
-                   if self._expired(session, now)]
-        for conn_id in expired:
-            self._remove_locked(conn_id)
+        expired: list[int] = []
+        for conn_id, session in list(self._sessions.items()):
+            reason = self._expiry_reason(session, now)
+            if reason is not None:
+                self._remove_locked(conn_id, reason=reason)
+                expired.append(conn_id)
         return expired
