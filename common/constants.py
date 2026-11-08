@@ -1,0 +1,38 @@
+# Protocol identification
+MAGIC = 0x4E43
+WIRE_VERSION = 1
+
+# UDP packet size
+HEADER_SIZE = 20
+GCM_TAG_SIZE = 16
+MAX_UDP_DATAGRAM = 1200
+MAX_DATA_PER_PACKET = 1024
+
+# Packet types
+REGISTER = 0x01
+REGISTER_OK = 0x02
+
+DATA = 0x10
+ACK = 0x11
+WINDOW_UPDATE = 0x12
+
+PING = 0x20
+PONG = 0x21
+
+CLOSE = 0x30
+
+# UDP configuration
+UDP_PORT = 9001
+
+# Supported UDP packet types
+VALID_PACKET_TYPES = frozenset({
+    REGISTER,
+    REGISTER_OK,
+    DATA,
+    ACK,
+    WINDOW_UPDATE,
+    PING,
+    PONG,
+    CLOSE,
+})
+
