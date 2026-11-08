@@ -2,7 +2,7 @@
 import threading
 
 from common.replay import ReplayWindow
-
+from common.constants import REPLAY_WINDOW_SIZE
 
 class TransportConnectionState:
     def __init__(self, conn_id: int):
@@ -13,7 +13,7 @@ class TransportConnectionState:
 
         self._next_send_packet_num = 0
 
-        self.recv_replay = ReplayWindow(size=4096)
+        self.recv_replay = ReplayWindow(size=REPLAY_WINDOW_SIZE)
 
         self._send_lock = threading.Lock()
 

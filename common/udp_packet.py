@@ -9,6 +9,8 @@ from common.constants import (
     MAX_UDP_DATAGRAM,
     REGISTER,
     REGISTER_OK,
+    PING, 
+    PONG
 )
 
 from common.crypto import encrypt_payload, decrypt_payload
@@ -25,6 +27,9 @@ def validate_uint64(value: int, name: str):
         raise ValueError(f"{name} must be uint64")
 
 def encode_header(packet_type, conn_id, pkt_num):
+    if type(packet_type) is not int:
+        raise ValueError("packet_type must be an integer")
+
     if packet_type not in VALID_PACKET_TYPES:
         raise ValueError("Unsupported packet type")
     
@@ -83,7 +88,7 @@ def encode_packet(
         raise ValueError("UDP payload too large")
 
     if packet_type in (REGISTER, REGISTER_OK) and plaintext:
-        raise ValueError("REGISTER packet must have empty body")
+        validate_packet_body(packet_type, plaintext)
 
     header = encode_header(packet_type, conn_id, pkt_num)
 
@@ -115,9 +120,20 @@ def decode_packet(key: bytes, packet: bytes):
         encrypted_payload,
         header
     )
-    
+
     if packet_type in (REGISTER, REGISTER_OK) and plaintext:
-        raise ValueError("REGISTER packet must have empty body")
+        validate_packet_body(packet_type, plaintext)
 
     return packet_type, conn_id, pkt_num, plaintext
+
+
+def validate_packet_body(packet_type: int, plaintext: bytes):
+    if packet_type in (REGISTER, REGISTER_OK):
+        if plaintext:
+            raise ValueError("REGISTER/REGISTER_OK body must be empty")
+
+    elif packet_type in (PING, PONG):
+        if len(plaintext) != 8:
+            raise ValueError("PING/PONG body must be 8 bytes")
+
 

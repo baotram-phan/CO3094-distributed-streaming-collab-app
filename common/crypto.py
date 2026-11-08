@@ -1,5 +1,9 @@
-
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from common.constants import (
+    AES_256_KEY_SIZE,
+    HEADER_SIZE,
+    GCM_TAG_SIZE,
+)
 
 def make_nonce(pkt_num: int) -> bytes:
     
@@ -17,7 +21,6 @@ def make_nonce(pkt_num: int) -> bytes:
 
     return prefix + packet_number_bytes
 
-
 def encrypt_payload(
     key: bytes,
     pkt_num: int,
@@ -25,10 +28,10 @@ def encrypt_payload(
     header: bytes
 ) -> bytes:
     
-    if len(key) != 32:
+    if len(key) != AES_256_KEY_SIZE:
         raise ValueError("AES-256 key must be 32 bytes")
 
-    if len(header) != 20:
+    if len(header) != HEADER_SIZE:
         raise ValueError("Invalid header size")
 
     nonce = make_nonce(pkt_num)
@@ -49,13 +52,13 @@ def decrypt_payload(
     header: bytes
 ) -> bytes:
 
-    if len(key) != 32:
+    if len(key) != AES_256_KEY_SIZE:
         raise ValueError("AES-256 key must be 32 bytes")
 
-    if len(header) != 20:
+    if len(header) != HEADER_SIZE:
         raise ValueError("Invalid header size")
 
-    if len(ciphertext) < 16:
+    if len(ciphertext) < GCM_TAG_SIZE:
         raise ValueError("Missing GCM authentication tag")
 
     nonce = make_nonce(pkt_num)

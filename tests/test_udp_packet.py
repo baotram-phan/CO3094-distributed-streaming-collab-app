@@ -25,6 +25,11 @@ class TestUDPHeader(unittest.TestCase):
         self.assertEqual(conn_id, 42)
         self.assertEqual(pkt_num, 0)
 
+    
+    def test_boolean_packet_type_rejected(self):
+        with self.assertRaises(ValueError):
+            encode_header(True, 42, 0)
+
     def test_invalid_header_size(self):
         header = encode_header(0x01, 42, 0)
 
