@@ -87,8 +87,7 @@ def encode_packet(
     if len(plaintext) > max_plaintext:
         raise ValueError("UDP payload too large")
 
-    if packet_type in (REGISTER, REGISTER_OK) and plaintext:
-        validate_packet_body(packet_type, plaintext)
+    validate_packet_body(packet_type, plaintext)
 
     header = encode_header(packet_type, conn_id, pkt_num)
 
@@ -121,8 +120,7 @@ def decode_packet(key: bytes, packet: bytes):
         header
     )
 
-    if packet_type in (REGISTER, REGISTER_OK) and plaintext:
-        validate_packet_body(packet_type, plaintext)
+    validate_packet_body(packet_type, plaintext)
 
     return packet_type, conn_id, pkt_num, plaintext
 
