@@ -1,10 +1,18 @@
 import unittest
 
+from common.constants import (
+    REGISTER,
+    REGISTER_OK,
+    PING, 
+    PONG
+)
+
 from common.udp_packet import (
     encode_header,
     decode_header,
     encode_packet,
-    decode_packet
+    decode_packet,
+    validate_packet_body
 )
 
 from cryptography.exceptions import InvalidTag
@@ -179,6 +187,23 @@ class TestUDPHeader(unittest.TestCase):
 
         with self.assertRaises(InvalidTag):
             decode_packet(key, bytes(modified_packet))
+
+        def test_ping_invalid_body(self):
+            with self.assertRaises(ValueError):
+                validate_packet_body(PING, b"abc")
+
+
+        def test_ping_valid_body(self):
+            validate_packet_body(PING, b"\x00" * 8)
+
+
+        def test_register_invalid_body(self):
+            with self.assertRaises(ValueError):
+                validate_packet_body(REGISTER, b"abc")
+
+
+        def test_register_valid_body(self):
+            validate_packet_body(REGISTER, b"")
 
 
 if __name__ == "__main__":

@@ -5,12 +5,14 @@ from common.constants import (
     GCM_TAG_SIZE,
 )
 
+MAX_UINT64 = (1 << 64) - 1
+
 def make_nonce(pkt_num: int) -> bytes:
     
     if type(pkt_num) is not int:
         raise ValueError("pkt_num must be an integer")
 
-    if not (0 <= pkt_num < (1 << 64)):
+    if not (0 <= pkt_num < MAX_UINT64):
         raise ValueError("pkt_num must be uint64")
 
     prefix = b"\x00" * 4
