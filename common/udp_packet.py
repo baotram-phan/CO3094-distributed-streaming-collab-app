@@ -129,7 +129,7 @@ def decode_packet(key: bytes, packet: bytes):
 
 def validate_packet_body(packet_type: int, plaintext: bytes):
     if packet_type in (REGISTER, REGISTER_OK):
-        if plaintext:
+        if len(plaintext) != 0:
             raise ValueError("REGISTER/REGISTER_OK body must be empty")
 
     elif packet_type in (PING, PONG):
