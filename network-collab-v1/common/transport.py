@@ -24,6 +24,20 @@ from common.constants import (
     ACK, GCM_TAG_SIZE, HEADER_SIZE, MAX_UDP_DATAGRAM,
     REPLAY_WINDOW_SIZE, DATA, VALID_PACKET_TYPES,
 )
+# Constants stay internal until A/B settle the reliable transport ABI.
+RTO_INIT_MS = 500.0
+RTO_MIN_MS = 100.0
+RTO_MAX_MS = 3000.0
+ACK_DELAY_CAP_MS = 25
+# This code is appended after RttEstimator and does NOT retransmit datagrams.
+PACKET_LOSS_THRESHOLD = 3
+# B3.2.3 — DATA retransmission scheduling (§6.2 Protocol v1.0-proposed).
+# No socket I/O or application callbacks. A/B integration ABI remains pending.
+from collections import deque
+from common.udp_packet import encode_data_body, encode_packet, DATA_STRUCT
+
+MAX_DATA_RETRANSMISSIONS = 8
+
 from common.streams import StreamSendFrame
 from common.transport_state import TransportConnectionState
 from common.udp_packet import MAX_ACK_RANGES, decode_ack_body, encode_ack_body
@@ -117,6 +131,10 @@ class SentPacketTracker:
     def get(self, packet_num: int) -> SentPacket | None:
         _packet_number(packet_num)
         return self._outstanding.get(packet_num)
+
+    def outstanding_packets(self) -> tuple[SentPacket, ...]:
+        """Return a snapshot of packets waiting for ACK."""
+        return tuple(self._outstanding.values())
 
     def can_track(self, datagram_size: int) -> bool:
         """Capacity preflight for a prospective ACK-eliciting datagram.
@@ -365,3 +383,455 @@ class ConnectionAckState:
     def allocate_packet_number(self) -> int:
         """Never allocate a second independent packet-number sequence."""
         return self.transport_state.allocate_packet_number()
+
+class RttEstimator:
+    """One sender-side RTT/RTO estimator per connection, with no UDP I/O.
+
+    Accept *only* a packet's first newly authenticated ACK as an RTT sample:
+    `SentPacketTracker.process_ack()` supplies `AckReceipt.newly_acked`.
+    B3.2.2 must call `on_timeout()` only when an actual timer fires.
+
+    All times use the SAME monotonic clock in milliseconds. `ack_delay_ms`
+    comes from an authenticated ACK and is capped at the protocol's 25 ms;
+    adjustments never make the sample negative. This is an internal B API,
+    not an agreed callback interface with A.
+    """
+
+    def __init__(self) -> None:
+        self.smoothed_rtt_ms: float | None = None
+        self.rttvar_ms: float | None = None
+        self.latest_rtt_ms: float | None = None
+        self.last_adjusted_rtt_ms: float | None = None
+        self.sample_count = 0
+        self.timeout_count = 0
+        self._current_rto_ms = RTO_INIT_MS
+
+    @property
+    def rto_ms(self) -> float:
+        """Current retransmission timeout including exponential backoff."""
+        return self._current_rto_ms
+
+    @property
+    def base_rto_ms(self) -> float:
+        """RTO inferred from RTT, without timeout backoff."""
+        if self.smoothed_rtt_ms is None or self.rttvar_ms is None:
+            return RTO_INIT_MS
+        return min(RTO_MAX_MS, max(RTO_MIN_MS, self.smoothed_rtt_ms + 4 * self.rttvar_ms))
+
+    def record_sample(self, raw_rtt_ms: float | int, *, ack_delay_ms: int = 0) -> float:
+        """Update SRTT/RTTVAR from one validated RTT observation.
+
+        Uses first-sample RTTVAR=RTT/2; subsequent EWMA weights 1/4
+        (variation) and 1/8 (smoothed RTT). ACK delay is bounded at 25 ms.
+        A new valid sample clears timeout backoff.
+        """
+        raw_rtt = _clock_ms(raw_rtt_ms)
+        if type(ack_delay_ms) is not int or not 0 <= ack_delay_ms <= 0xFFFF:
+            raise ValueError("ack_delay_ms must be uint16")
+        adjusted = max(0.0, raw_rtt - min(ack_delay_ms, ACK_DELAY_CAP_MS))
+
+        if self.smoothed_rtt_ms is None:
+            self.smoothed_rtt_ms = adjusted
+            self.rttvar_ms = adjusted / 2.0
+        else:
+            # rttvar exists whenever smoothed_rtt exists.
+            assert self.rttvar_ms is not None
+            self.rttvar_ms = 0.75 * self.rttvar_ms + 0.25 * abs(self.smoothed_rtt_ms - adjusted)
+            self.smoothed_rtt_ms = 0.875 * self.smoothed_rtt_ms + 0.125 * adjusted
+
+        self.latest_rtt_ms = raw_rtt
+        self.last_adjusted_rtt_ms = adjusted
+        self.sample_count += 1
+        self.timeout_count = 0
+        self._current_rto_ms = self.base_rto_ms
+        return adjusted
+
+    def record_ack(self, receipt: AckReceipt, received_at_ms: float | int) -> float | None:
+        """Sample only the highest-numbered *newly acknowledged* packet.
+
+        A duplicate/unknown-only ACK supplies no sample and cannot reset
+        timeout backoff. The caller must authenticate/replay-check ACK before
+        running `SentPacketTracker.process_ack()` and then this method.
+        """
+        if not isinstance(receipt, AckReceipt):
+            raise TypeError("receipt must be AckReceipt")
+        now = _clock_ms(received_at_ms)
+        if type(receipt.ack_delay_ms) is not int or not 0 <= receipt.ack_delay_ms <= 0xFFFF:
+            raise ValueError("receipt ack_delay_ms must be uint16")
+        if not receipt.newly_acked:
+            return None
+        packet = max(receipt.newly_acked, key=lambda p: p.packet_num)
+        sent_at = _clock_ms(packet.sent_at_ms)
+        if now < sent_at:
+            raise ValueError("ACK clock cannot precede the acknowledged packet send time")
+        return self.record_sample(now - sent_at, ack_delay_ms=receipt.ack_delay_ms)
+
+    def on_timeout(self) -> float:
+        """Exponential timeout backoff, saturated at RTO_MAX_MS.
+
+        Called by the FUTURE retransmission scheduler, not by a timer in this
+        class. RTT tracking alone must not infer that a packet was lost.
+        """
+        self._current_rto_ms = min(RTO_MAX_MS, self._current_rto_ms * 2.0)
+        self.timeout_count += 1
+        return self._current_rto_ms
+
+@dataclass(frozen=True, slots=True)
+class LostPacket:
+    """One newly detected loss; the original tracker entry is NOT removed.
+
+    The B3.2.3 sender must safely hand off/retire the original tracked packet,
+    and must allocate a NEW packet number to retransmit its original frame.
+    """
+
+    packet: SentPacket
+    reason: str                  # "packet_threshold" or "rto"
+    detected_at_ms: float
+
+
+class PacketLossDetector:
+    """Bounded, one-shot packet loss signals for ONE outgoing connection.
+
+    - Packet threshold counts *newly ACKed, tracked, ACK-eliciting packets*,
+      not differences between packet numbers (ACK-only numbers may intervene).
+    - Keep only the 3 largest distinct ACKed numbers: that is sufficient to
+      determine whether >=3 later ACK-eliciting packets were ACKed for ANY
+      still-pending packet, without unbounded ACK-history retention.
+    - RTO checks use the RttEstimator's current RTO, with one timeout backoff
+      per batch containing newly reported RTO losses.
+    - No I/O, callbacks, packet-number allocation or tracker retirement.
+
+    Caller serializes operations per ConnID and must call process_ack() on an
+    authenticated/validated/replay-checked ACK BEFORE on_ack(). Never share
+    this detector or its RttEstimator across different connections.
+    """
+
+    def __init__(self) -> None:
+        self._largest_acked: tuple[int, ...] = ()
+        self._already_reported: set[int] = set()
+        self._last_checked_ms: float | None = None
+
+    @property
+    def largest_acked_packets(self) -> tuple[int, ...]:
+        """Up to three descending ACKed ACK-eliciting packet numbers."""
+        return self._largest_acked
+
+    @property
+    def pending_loss_reports(self) -> int:
+        """Number of still-outstanding packets already flagged as lost."""
+        return len(self._already_reported)
+
+    def _validate_call(self, sent: SentPacketTracker, now_ms: float | int) -> float:
+        if not isinstance(sent, SentPacketTracker):
+            raise TypeError("sent must be SentPacketTracker")
+        now = _clock_ms(now_ms)
+        if self._last_checked_ms is not None and now < self._last_checked_ms:
+            raise ValueError("loss-detector timestamps must be monotonic")
+        return now
+
+    def _pending_and_prune(self, sent: SentPacketTracker) -> tuple[SentPacket, ...]:
+        pending = sent.outstanding_packets()
+        self._already_reported.intersection_update(packet.packet_num for packet in pending)
+        return pending
+
+    def on_ack(
+        self, receipt: AckReceipt, sent: SentPacketTracker, now_ms: float | int,
+    ) -> tuple[LostPacket, ...]:
+        """Report unACKed packets with >=3 later newly ACKed eliciting sends.
+
+        `receipt` MUST be the output of sent.process_ack() on a validated ACK.
+        Subsequent/duplicate ACKs cannot count a packet again. Reporting does
+        not retire a packet, change bytes_in_flight, or change RTO.
+        """
+        if not isinstance(receipt, AckReceipt):
+            raise TypeError("receipt must be AckReceipt")
+        now = self._validate_call(sent, now_ms)
+        if any(packet.sent_at_ms > now for packet in receipt.newly_acked):
+            raise ValueError("ACK time cannot precede the acknowledged send time")
+
+        pending = self._pending_and_prune(sent)
+        self._largest_acked = tuple(sorted(
+            set(self._largest_acked).union(p.packet_num for p in receipt.newly_acked),
+            reverse=True,
+        )[:PACKET_LOSS_THRESHOLD])
+        self._last_checked_ms = now
+        if len(self._largest_acked) < PACKET_LOSS_THRESHOLD:
+            return ()
+
+        # Third-largest ACKed packet is the threshold cutoff.  For original
+        # packet n, exactly 3 ACKed later packets exist iff n < cutoff.
+        cutoff = self._largest_acked[-1]
+        newly_lost = tuple(
+            LostPacket(p, "packet_threshold", now)
+            for p in sorted(pending, key=lambda p: p.packet_num)
+            if p.packet_num < cutoff and p.packet_num not in self._already_reported
+        )
+        self._already_reported.update(loss.packet.packet_num for loss in newly_lost)
+        return newly_lost
+
+    def check_timeouts(
+        self, sent: SentPacketTracker, rtt: RttEstimator, now_ms: float | int,
+    ) -> tuple[LostPacket, ...]:
+        """Report newly timed-out packets; back off RTO ONCE if any fire.
+
+        Timeouts use the RTO value at entry, BEFORE the exponential backoff.
+        Repeated polling of an unretired packet does not trigger another loss
+        or backoff. The retransmission scheduler will retire/handoff in B3.2.3.
+        """
+        if not isinstance(rtt, RttEstimator):
+            raise TypeError("rtt must be RttEstimator")
+        now = self._validate_call(sent, now_ms)
+        pending = sent.outstanding_packets()
+        if any(packet.sent_at_ms > now for packet in pending):
+            raise ValueError("loss-check time cannot precede pending send times")
+
+        pending = self._pending_and_prune(sent)
+        timeout_ms = rtt.rto_ms
+        newly_lost = tuple(
+            LostPacket(p, "rto", now)
+            for p in sorted(pending, key=lambda p: p.packet_num)
+            if p.packet_num not in self._already_reported
+            and now - p.sent_at_ms >= timeout_ms
+        )
+        self._already_reported.update(loss.packet.packet_num for loss in newly_lost)
+        self._last_checked_ms = now
+        if newly_lost:
+            rtt.on_timeout()
+        return newly_lost
+    
+@dataclass(frozen=True, slots=True)
+class PreparedRetransmission:
+    """A fresh encrypted DATA datagram reserved for one socket send attempt.
+
+    The packet number is consumed even if the send later fails; callers MUST
+    commit_sent() on success, or abort_send() on a definite send failure.
+    """
+
+    packet_num: int
+    frame: StreamSendFrame
+    datagram: bytes
+    retry_number: int
+
+
+@dataclass(slots=True)
+class _RetryGroup:
+    """One logical DATA frame across all of its packet-number attempts."""
+
+    frame: StreamSendFrame
+    packet_numbers: set[int]
+    retry_count: int = 0
+    queued: bool = False
+
+
+class DataRetransmissionQueue:
+    """Bounded, in-memory resend scheduler for ONE connection and direction.
+
+    Each logical DATA frame has at most one queued retry and one in-flight
+    prepared send. Old packet numbers are retained so a *late valid ACK* can
+    cancel a queued retransmission after loss was reported.
+
+    No socket calls, Registry operations, callbacks, locks, or CUBIC. All
+    methods are called serially for the same ConnID. The encrypted datagram
+    returned by prepare_next() is passed to the *existing* socket send path.
+
+    Loss transition is safe: store the frame in a bounded group and queue
+    BEFORE retiring the lost packet from SentPacketTracker. If capacity is
+    exhausted, BufferError is raised with the original tracker entry intact;
+    the caller MUST retain/retry that loss notification (one-shot detector).
+
+    To handle late ACKs for retired packet numbers, call on_ack(receipt,sent)
+    after the authenticated ACK has passed through sent.process_ack().
+    """
+
+    def __init__(
+        self,
+        conn_id: int,
+        *,
+        max_tracked_frames: int = 1024,
+        max_queued_frames: int = 256,
+        max_queued_bytes: int = 256 * 1024,
+        max_retransmissions: int = MAX_DATA_RETRANSMISSIONS,
+    ) -> None:
+        if type(conn_id) is not int or not 1 <= conn_id <= _UINT64_MAX:
+            raise ValueError("conn_id must be nonzero uint64")
+        for name, value in (
+            ("max_tracked_frames", max_tracked_frames),
+            ("max_queued_frames", max_queued_frames),
+            ("max_queued_bytes", max_queued_bytes),
+            ("max_retransmissions", max_retransmissions),
+        ):
+            if type(value) is not int or not 1 <= value <= _UINT64_MAX:
+                raise ValueError(f"{name} must be positive integer")
+        self.conn_id = conn_id
+        self.max_tracked_frames = max_tracked_frames
+        self.max_queued_frames = max_queued_frames
+        self.max_queued_bytes = max_queued_bytes
+        self.max_retransmissions = max_retransmissions
+        self._groups: dict[StreamSendFrame, _RetryGroup] = {}
+        self._packet_to_frame: dict[int, StreamSendFrame] = {}
+        self._queue: deque[StreamSendFrame] = deque()
+        self._queued_bytes = 0
+        self._prepared: PreparedRetransmission | None = None
+
+    @property
+    def queued_count(self) -> int:
+        return len(self._queue)
+
+    @property
+    def queued_bytes(self) -> int:
+        return self._queued_bytes
+
+    @property
+    def tracked_frames(self) -> int:
+        return len(self._groups)
+
+    @property
+    def prepared(self) -> PreparedRetransmission | None:
+        return self._prepared
+
+    def note_loss(self, lost: LostPacket, sent: SentPacketTracker) -> bool:
+        """Queue retransmission after a fresh DATA loss report.
+
+        True iff a still-outstanding DATA attempt was safely retired.
+        False for a stale signal already ACKed/retired; non-DATA losses
+        explicitly require a different control-packet retry path.
+        """
+        if not isinstance(lost, LostPacket):
+            raise TypeError("lost must be LostPacket")
+        if not isinstance(sent, SentPacketTracker):
+            raise TypeError("sent must be SentPacketTracker")
+        packet = lost.packet
+        if packet.packet_type != DATA or packet.frame is None:
+            raise NotImplementedError("B3.2.3 retries DATA only; WINDOW_UPDATE needs control retry")
+        current = sent.get(packet.packet_num)
+        if current is None:
+            return False
+        if current != packet:
+            raise ValueError("loss signal does not match tracked packet")
+
+        frame = packet.frame
+        group = self._groups.get(frame)
+        need_enqueue = group is None or not group.queued
+        if group is None and len(self._groups) >= self.max_tracked_frames:
+            raise BufferError("retransmission frame history full")
+        if group is not None and group.retry_count >= self.max_retransmissions and need_enqueue:
+            raise TimeoutError("DATA retransmission limit reached; report TIMEOUT to application")
+        if need_enqueue:
+            if len(self._queue) >= self.max_queued_frames:
+                raise BufferError("retransmission queue full")
+            if self._queued_bytes + len(frame.data) > self.max_queued_bytes:
+                raise BufferError("retransmission byte budget exhausted")
+
+        # Safe handoff: establish ownership in our bounded state FIRST.
+        if group is None:
+            group = _RetryGroup(frame=frame, packet_numbers=set())
+            self._groups[frame] = group
+        if need_enqueue:
+            self._queue.append(frame)
+            self._queued_bytes += len(frame.data)
+            group.queued = True
+        group.packet_numbers.add(packet.packet_num)
+        self._packet_to_frame[packet.packet_num] = frame
+        removed = sent.cancel_sent(packet.packet_num)
+        assert removed is not None  # serialized access per ConnID
+        return True
+
+    def prepare_next(
+        self,
+        connection: TransportConnectionState,
+        sent: SentPacketTracker,
+        key: bytes,
+        now_ms: float | int,
+    ) -> PreparedRetransmission | None:
+        """Reserve a new packet number and encrypt a queued DATA retry.
+
+        Returns None when empty or when in-flight tracker capacity is full.
+        Track BEFORE exposing bytes to the socket. Must commit/abort later.
+        """
+        if not isinstance(connection, TransportConnectionState):
+            raise TypeError("connection must be TransportConnectionState")
+        if connection.conn_id != self.conn_id:
+            raise ValueError("connection does not match retransmission queue ConnID")
+        if not isinstance(sent, SentPacketTracker):
+            raise TypeError("sent must be SentPacketTracker")
+        now = _clock_ms(now_ms)
+        if self._prepared is not None:
+            raise RuntimeError("previous DATA retry has not been committed or aborted")
+        if not self._queue:
+            return None
+        frame = self._queue[0]
+        group = self._groups[frame]
+        if group.retry_count >= self.max_retransmissions:
+            raise TimeoutError("DATA retransmission limit reached; report TIMEOUT to application")
+        datagram_size = HEADER_SIZE + GCM_TAG_SIZE + DATA_STRUCT.size + len(frame.data)
+        if not sent.can_track(datagram_size):
+            return None
+        body = encode_data_body(frame.stream_id, frame.offset, frame.flags, frame.data)
+        pn = connection.allocate_packet_number()  # fresh AES-GCM nonce, NEVER reused
+        datagram = encode_packet(key, DATA, self.conn_id, pn, body)
+        sent.track_sent(pn, DATA, len(datagram), now, frame=frame)
+        plan = PreparedRetransmission(pn, frame, datagram, group.retry_count + 1)
+        self._prepared = plan
+        return plan
+
+    def commit_sent(self, plan: PreparedRetransmission) -> None:
+        """Call only after socket.sendto successfully accepted the datagram."""
+        if plan is not self._prepared:
+            raise ValueError("plan is not the current prepared retransmission")
+        group = self._groups[plan.frame]
+        assert group.queued and self._queue[0] == plan.frame
+        self._queue.popleft()
+        self._queued_bytes -= len(plan.frame.data)
+        group.queued = False
+        group.retry_count += 1
+        group.packet_numbers.add(plan.packet_num)
+        self._packet_to_frame[plan.packet_num] = plan.frame
+        self._prepared = None
+
+    def abort_send(self, plan: PreparedRetransmission, sent: SentPacketTracker) -> None:
+        """Definite send failure: restore queued frame, but do NOT reuse nonce."""
+        if plan is not self._prepared:
+            raise ValueError("plan is not the current prepared retransmission")
+        if not isinstance(sent, SentPacketTracker):
+            raise TypeError("sent must be SentPacketTracker")
+        removed = sent.cancel_sent(plan.packet_num)
+        if removed is None or removed.frame != plan.frame:
+            raise RuntimeError("prepared packet missing from sent tracker")
+        # The queue and retry counter were not modified by prepare_next.
+        self._prepared = None
+
+    def on_ack(
+        self, receipt: AckReceipt, sent: SentPacketTracker,
+    ) -> tuple[StreamSendFrame, ...]:
+        """Cancel all later attempts if ANY packet number for a frame is ACKed.
+
+        Includes packet numbers retired as lost: sent.process_ack() no longer
+        knows those numbers, but this queue's bounded attempt history does.
+        ACK must be authenticated, replay-checked and validated FIRST.
+        """
+        if not isinstance(receipt, AckReceipt):
+            raise TypeError("receipt must be AckReceipt")
+        if not isinstance(sent, SentPacketTracker):
+            raise TypeError("sent must be SentPacketTracker")
+        acked_frames: set[StreamSendFrame] = set()
+        for packet_num, frame in self._packet_to_frame.items():
+            if any(start <= packet_num <= end for start, end in receipt.ranges):
+                acked_frames.add(frame)
+        completed: list[StreamSendFrame] = []
+        for frame in self._groups:
+            if frame not in acked_frames:
+                continue
+            group = self._groups[frame]
+            for packet_num in group.packet_numbers:
+                sent.cancel_sent(packet_num)
+                self._packet_to_frame.pop(packet_num, None)
+            if group.queued:
+                self._queue.remove(frame)
+                self._queued_bytes -= len(frame.data)
+            if self._prepared is not None and self._prepared.frame == frame:
+                sent.cancel_sent(self._prepared.packet_num)
+                self._prepared = None
+            completed.append(frame)
+        for frame in completed:
+            del self._groups[frame]
+        return tuple(completed)
