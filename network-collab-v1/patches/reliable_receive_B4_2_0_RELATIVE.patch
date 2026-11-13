@@ -1,0 +1,83 @@
+--- a/common/reliable_receive.py
++++ b/common/reliable_receive.py
+@@ -16,6 +16,9 @@
+ from cryptography.exceptions import InvalidTag
+ 
+ from common.constants import ACK, DATA, WINDOW_UPDATE, HEADER_SIZE, GCM_TAG_SIZE, MAX_UDP_DATAGRAM
++from common.cubic import CubicController
++from common.congestion_feedback import CongestionFeedback
++from common.send_scheduler import ConnectionSendScheduler, PreparedScheduledSend
+ from common.streams import StreamDelivery, StreamManager
+ from common.transport import (
+     AckReceipt, DataRetransmissionQueue, PacketLossDetector,
+@@ -69,6 +72,12 @@
+         self.retries = DataRetransmissionQueue(self.conn_id)
+         self.rtt = RttEstimator()
+         self.loss = PacketLossDetector()
++        # One CUBIC and one scheduler per ConnID; never reset on REGISTER retry.
++        self.cubic = CubicController(mss_bytes=1024)
++        self.congestion = CongestionFeedback(self.cubic)
++        self.scheduler = ConnectionSendScheduler(
++            self.streams, self.connection, self.sent, self.retries, self.flow
++        )
+         self.max_delivery_bytes = max_delivery_bytes
+         self.max_delivery_events = max_delivery_events
+         self._deliveries: deque[StreamDelivery] = deque()
+@@ -93,6 +102,39 @@
+         delivery = self._deliveries.popleft()
+         self._delivery_bytes -= len(delivery.data)
+         return delivery
++
++    def prepare_send(self, key: bytes, *, now_ms: float) -> PreparedScheduledSend | None:
++        """Prepare a packet using REAL CUBIC cwnd, not a demo constant.
++
++        B4.2.1 will call this under per-ConnID serialization, followed by
++        socket.sendto(), then commit_send() or abort_send(). No socket here.
++        """
++        if not self.congestion.can_note_sent():
++            return None  # bounded DATA attempt accounting; never silently drop
++        return self.scheduler.prepare_next(key, now_ms=now_ms, cwnd_bytes=self.cubic.cwnd_bytes)
++
++    def commit_send(self, plan: PreparedScheduledSend) -> None:
++        """Commit after a full successful socket send, then record DATA attempt."""
++        self.scheduler.commit_sent(plan)
++        self.congestion.note_sent(plan)
++
++    def abort_send(self, plan: PreparedScheduledSend) -> None:
++        """Definite socket failure: retain DATA and burn the packet number."""
++        self.scheduler.abort_send(plan)
++
++    def check_rto(self, *, now_ms: float) -> tuple:
++        """One timer tick: detect RTO, back off RTT once, notify CUBIC once.
++
++        Returns loss signals. B4.3 will schedule this function periodically.
++        """
++        losses = self.loss.check_timeouts(self.sent, self.rtt, now_ms)
++        self.congestion.on_losses(losses, now_ms=now_ms)
++        for item in losses:
++            if item.packet.packet_type == DATA:
++                self.retries.note_loss(item, self.sent)
++            elif item.packet.packet_type == WINDOW_UPDATE:
++                self.flow.note_loss(item, self.sent)
++        return losses
+ 
+     def accept(
+         self,
+@@ -164,9 +206,15 @@
+             receipt: AckReceipt = self.sent.process_ack(body)
+             lost = self.loss.on_ack(receipt, self.sent, now_ms)
+             self.rtt.record_ack(receipt, now_ms)
+-            self.retries.on_ack(receipt, self.sent)
++            completed = self.retries.on_ack(receipt, self.sent)
+             self.flow.on_ack(receipt, self.sent)
+-            for item in lost:
++            # Cancel spurious loss reports already retired by ACK completion.
++            active_losses = tuple(
++                item for item in lost if self.sent.get(item.packet.packet_num) is not None
++            )
++            self.congestion.on_losses(active_losses, now_ms=now_ms)
++            self.congestion.on_feedback(receipt, completed, self.rtt, now_ms=now_ms)
++            for item in active_losses:
+                 if item.packet.packet_type == DATA:
+                     self.retries.note_loss(item, self.sent)
+                 elif item.packet.packet_type == WINDOW_UPDATE:

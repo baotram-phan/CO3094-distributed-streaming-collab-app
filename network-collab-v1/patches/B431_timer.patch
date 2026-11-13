@@ -1,0 +1,144 @@
+diff --git a/common/transport.py b/common/transport.py
+--- a/common/transport.py
++++ b/common/transport.py
+@@ -245,6 +245,9 @@
+         self._generation = 0
+         self._cursor = 0
+         self._ack_pending = False
++        # Earliest time at which the current ACK batch became pending.
++        # Keep this deadline while a multi-range ACK batch is in progress.
++        self._ack_pending_since_ms: float | None = None
+ 
+     @property
+     def tracked_count(self) -> int:
+@@ -253,6 +256,32 @@
+     @property
+     def ack_pending(self) -> bool:
+         return self._ack_pending
++
++    @property
++    def ack_pending_since_ms(self) -> float | None:
++        """Earliest unflushed ACK-eliciting receipt, or None when idle."""
++        return self._ack_pending_since_ms
++
++    def ack_due(self, now_ms: float | int, *, max_delay_ms: float = ACK_DELAY_CAP_MS) -> bool:
++        """Whether an ACK should be sent *by now* (no network I/O).
++
++        UDP ACK-only packets never set this deadline. A valid replay request
++        uses its original receipt timestamp, so a lost ACK can be resent
++        promptly. `max_delay_ms` cannot exceed the protocol's 25 ms limit.
++        """
++        now = _clock_ms(now_ms)
++        if type(max_delay_ms) not in (int, float) or not isfinite(max_delay_ms):
++            raise ValueError("max_delay_ms must be a finite number")
++        if not 0 <= max_delay_ms <= ACK_DELAY_CAP_MS:
++            raise ValueError("max_delay_ms must be in 0..25")
++        if not self._ack_pending:
++            return False
++        pending_since = self._ack_pending_since_ms
++        if pending_since is None:
++            raise RuntimeError("ACK pending without a receipt timestamp")
++        if now < pending_since:
++            raise ValueError("ACK clock cannot precede the receipt time")
++        return now - pending_since >= max_delay_ms
+ 
+     def note_received(self, packet_num: int, packet_type: int, received_at_ms: float | int) -> bool:
+         """Call for a newly accepted (ReplayWindow.commit=True) packet.
+@@ -275,6 +304,10 @@
+         self._received_at = {n: t for n, t in self._received_at.items() if n >= cutoff}
+         self._generation += 1
+         self._cursor = 0
++        if self._ack_pending_since_ms is None:
++            self._ack_pending_since_ms = stamp
++        else:
++            self._ack_pending_since_ms = min(self._ack_pending_since_ms, stamp)
+         self._ack_pending = True
+         return True
+ 
+@@ -285,10 +318,15 @@
+         The transport must authenticate and check the endpoint first.
+         """
+         _packet_number(packet_num)
+-        if packet_num not in self._received_at:
++        received_at = self._received_at.get(packet_num)
++        if received_at is None:
+             return False
+         self._generation += 1
+         self._cursor = 0
++        if self._ack_pending_since_ms is None:
++            self._ack_pending_since_ms = received_at
++        else:
++            self._ack_pending_since_ms = min(self._ack_pending_since_ms, received_at)
+         self._ack_pending = True
+         return True
+ 
+@@ -352,6 +390,7 @@
+         else:
+             self._cursor = 0
+             self._ack_pending = False
++            self._ack_pending_since_ms = None
+         return True
+ 
+ 
+diff --git a/common/reliable_receive.py b/common/reliable_receive.py
+--- a/common/reliable_receive.py
++++ b/common/reliable_receive.py
+@@ -22,7 +22,7 @@
+ from common.streams import StreamDelivery, StreamManager
+ from common.transport import (
+     AckReceipt, DataRetransmissionQueue, PacketLossDetector,
+-    ReceivedPacketAckTracker, RttEstimator, SentPacketTracker,
++    ReceivedPacketAckTracker, RttEstimator, SentPacketTracker, LostPacket, _clock_ms,
+ )
+ from common.transport_state import TransportConnectionState
+ from common.udp_packet import decode_data_body, decode_header, decode_packet
+@@ -37,6 +37,18 @@
+     delivery_enqueued: bool = False
+     credit_advanced: bool = False
+     newly_acked_packets: tuple[int, ...] = ()
++
++
++@dataclass(frozen=True, slots=True)
++class TimerTickResult:
++    """What one deterministic timer poll discovered; it never sends packets.
++
++    `ack_due` means the socket adapter should send one pending ACK snapshot.
++    `newly_lost` is already handed to the B3 DATA/WINDOW_UPDATE retry queues.
++    """
++
++    ack_due: bool
++    newly_lost: tuple[LostPacket, ...]
+ 
+ 
+ class ReliableReceiveState:
+@@ -122,7 +134,7 @@
+         """Definite socket failure: retain DATA and burn the packet number."""
+         self.scheduler.abort_send(plan)
+ 
+-    def check_rto(self, *, now_ms: float) -> tuple:
++    def check_rto(self, *, now_ms: float) -> tuple[LostPacket, ...]:
+         """One timer tick: detect RTO, back off RTT once, notify CUBIC once.
+ 
+         Returns loss signals. B4.3 will schedule this function periodically.
+@@ -135,6 +147,21 @@
+             elif item.packet.packet_type == WINDOW_UPDATE:
+                 self.flow.note_loss(item, self.sent)
+         return losses
++
++    def timer_tick(self, *, now_ms: float | int) -> TimerTickResult:
++        """Run ACK-deadline and RTO decisions using ONE monotonic clock.
++
++        Called periodically by the *future* UDP event-loop integration B4.3.2.
++        No socket calls, callbacks, threads, sleeps, or Registry accesses.
++        Callers serialize per ConnID with DATA/ACK receive and send operations.
++
++        `ack_due` stays True until the socket confirms send_ack_once() and
++        ReceivedPacketAckTracker.mark_ack_sent() completes its batch.
++        """
++        now = _clock_ms(now_ms)
++        due = self.received.ack_due(now)
++        losses = self.check_rto(now_ms=now)
++        return TimerTickResult(ack_due=due, newly_lost=losses)
+ 
+     def accept(
+         self,

@@ -302,6 +302,27 @@ class StreamSendState:
         changed = new_max_offset > self.advertised_max_offset
         self.advertised_max_offset = new_max_offset
         return changed
+    
+    def peek_next_frame(self, *, max_payload: int = MAX_DATA_PER_PACKET) -> StreamSendFrame | None:
+        """Preview the next DATA without consuming bytes, offset or FIN.
+
+        Must be followed by next_frame() under the SAME serialized ConnID
+        transport state. Send scheduler uses this for preflight/packet tracking.
+        """
+        if type(max_payload) is not int or not 1 <= max_payload <= MAX_DATA_PER_PACKET:
+            raise ValueError("max_payload must be in 1..MAX_DATA_PER_PACKET")
+        if self._fin_emitted:
+            return None
+        credit = max(0, self.advertised_max_offset - self.next_offset)
+        size = min(len(self._pending), max_payload, credit)
+        if size:
+            return StreamSendFrame(
+                self.stream_id, self.next_offset, bytes(self._pending[:size]),
+                self._fin_queued and size == len(self._pending),
+            )
+        if self._fin_queued and not self._pending and self.next_offset <= self.advertised_max_offset:
+            return StreamSendFrame(self.stream_id, self.next_offset, b"", True)
+        return None
 
     def next_frame(self, *, max_payload: int = MAX_DATA_PER_PACKET) -> StreamSendFrame | None:
         """Produce one NEW DATA frame within credit; never creates UDP packet.
@@ -482,6 +503,15 @@ class StreamManager:
         if self.buffered_bytes + len(data) > self.max_buffered_bytes:
             raise ValueError("connection-wide stream buffer capacity exceeded")
         state.queue(data, fin=fin)
+
+    def peek_send_frame(
+        self,
+        stream_id: int,
+        *,
+        max_payload: int = MAX_DATA_PER_PACKET,
+    ) -> StreamSendFrame | None:
+        """Non-consuming preview; the B3 send scheduler may use it for preflight."""
+        return self._send_state(stream_id).peek_next_frame(max_payload=max_payload)
 
     def next_send_frame(
         self,

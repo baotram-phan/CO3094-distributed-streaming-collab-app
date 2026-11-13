@@ -1,0 +1,190 @@
+diff --git a/network-collab-v1/client/core/udp_connection.py b/network-collab-v1/client/core/udp_connection.py
+index 3feda3d..4499e89 100644
+--- a/network-collab-v1/client/core/udp_connection.py
++++ b/network-collab-v1/client/core/udp_connection.py
+@@ -164,7 +164,7 @@ class UDPRegistrationClient:
+ 
+         None = idle or backpressured. A definite OSError aborts the staged
+         plan, burns the packet number, and propagates the error to the caller.
+-        Caller drives this explicitly until the B4.3 timer/loop is integrated.
++        The B4.3 pump calls this automatically when enabled.
+         """
+         with self._transport_lock:
+             receiver = self._require_reliable()
+@@ -201,6 +201,57 @@ class UDPRegistrationClient:
+             receiver.received.mark_ack_sent(snapshot)
+             return True
+ 
++    def pump_reliable_once(
++        self, *, timeout_s: float = 0.01, max_packets: int = 32,
++    ) -> ReceiveResult | None:
++        """One receive + timer + bounded send round for the REGISTER socket.
++
++        Call this repeatedly from exactly ONE client UDP receive loop. It
++        works when the network is silent: recvfrom times out, then the RTO
++        timer still runs. Do not call concurrently with register(),
++        receive_reliable_once(), or another pump. Applications may enqueue
++        stream bytes from other threads via queue_reliable_bytes().
++
++        ACKs have priority over DATA/retries. `max_packets` bounds the total
++        datagrams sent by this round; no per-packet thread is created.
++        """
++        if type(max_packets) is not int or not 1 <= max_packets <= 128:
++            raise ValueError("max_packets must be in 1..128")
++        if timeout_s <= 0:
++            raise ValueError("timeout_s must be positive")
++        self._require_reliable()
++        try:
++            result = self.receive_reliable_once(timeout_s=timeout_s)
++        except OSError:
++            if self._closed:
++                return None
++            raise
++        with self._transport_lock:
++            receiver = self._require_reliable()
++            due = receiver.timer_tick(now_ms=time.monotonic() * 1000).ack_due
++        budget = max_packets
++        if due and self.send_ack_once():
++            budget -= 1
++        while budget > 0:
++            if self.send_reliable_once() is None:
++                break
++            budget -= 1
++        return result
++
++    def run_reliable_loop(
++        self, stop_event: threading.Event, *, timeout_s: float = 0.01,
++        max_packets: int = 32,
++    ) -> None:
++        """Blocking UDP event loop; caller owns its single worker/thread.
++
++        Invoke only after register(), and keep socket receive ownership here.
++        Use stop_event.set() or close() to finish; no background worker is
++        created by the transport itself.
++        """
++        self._require_reliable()
++        while not self._closed and not stop_event.is_set():
++            self.pump_reliable_once(timeout_s=timeout_s, max_packets=max_packets)
++
+     def close(self) -> None:
+         if not self._closed:
+             self._closed = True
+diff --git a/network-collab-v1/server/udp_service.py b/network-collab-v1/server/udp_service.py
+index b9212e7..48f5332 100644
+--- a/network-collab-v1/server/udp_service.py
++++ b/network-collab-v1/server/udp_service.py
+@@ -31,7 +31,20 @@ class UDPTransportService:
+         port: int = 9001,
+         on_udp_registered: Callable[[int, tuple[str, int]], None] | None = None,
+         logger: Callable[[str], None] | None = print,
++        auto_drive: bool = False,
++        tick_interval_s: float = 0.01,
++        max_packets_per_tick: int = 32,
+     ) -> None:
++        if type(auto_drive) is not bool:
++            raise ValueError("auto_drive must be bool")
++        if not 0 < tick_interval_s <= 0.025:
++            raise ValueError("tick_interval_s must be in (0, 0.025]")
++        if type(max_packets_per_tick) is not int or not 1 <= max_packets_per_tick <= 128:
++            raise ValueError("max_packets_per_tick must be in 1..128")
++        self.auto_drive = auto_drive
++        self.tick_interval_s = tick_interval_s
++        self.max_packets_per_tick = max_packets_per_tick
++        self._pump_cursor = 0
+         self.registry = registry  # MUST be the same instance as TLS bootstrap.
+         self.on_udp_registered = on_udp_registered
+         self._log = logger
+@@ -44,7 +57,7 @@ class UDPTransportService:
+         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+         try:
+             self.sock.bind((host, port))
+-            self.sock.settimeout(0.1)
++            self.sock.settimeout(tick_interval_s if auto_drive else 0.1)
+         except Exception:
+             self.sock.close()
+             raise
+@@ -308,6 +321,75 @@ class UDPTransportService:
+             # No error response to unauthenticated UDP; avoid leaking secrets.
+             return False
+ 
++    def pump_reliable_once(self, *, max_packets: int | None = None) -> int:
++        """One bounded, fair timer/scheduling round for all live ConnIDs.
++
++        Never calls Registry with the lifecycle lock held. Timer checks occur
++        for every active connection even when the send budget is exhausted.
++        No new thread or independently owned connection state is created.
++        `remove_connection()` tombstones immediately cancel later sends.
++
++        Returns the count of ACK/DATA/WINDOW_UPDATE datagrams sent. A single
++        sendto OSError is logged and leaves the staged DATA/ACK eligible for
++        a later pump, rather than killing the server receive loop.
++        """
++        budget = self.max_packets_per_tick if max_packets is None else max_packets
++        if type(budget) is not int or not 1 <= budget <= 128:
++            raise ValueError("max_packets must be in 1..128")
++        if self._stopping.is_set():
++            return 0
++        with self._lifecycle_lock:
++            ids = sorted(self._reliable)
++            if not ids:
++                return 0
++            start = self._pump_cursor % len(ids)
++            ids = ids[start:] + ids[:start]
++            self._pump_cursor = (start + 1) % len(ids)
++        now_ms = time.monotonic() * 1000
++        due_ids: list[int] = []
++        active_ids: list[int] = []
++        for conn_id in ids:
++            # Registry calls are ALWAYS outside the transport/lifecycle lock.
++            if self._bound_session_for_send(conn_id) is None:
++                continue
++            with self._lifecycle_lock:
++                receiver = self._reliable.get(conn_id)
++                if (self._stopping.is_set() or conn_id in self._closed_conn_ids
++                        or receiver is None):
++                    continue
++                due = receiver.timer_tick(now_ms=now_ms).ack_due
++            active_ids.append(conn_id)
++            if due:
++                due_ids.append(conn_id)
++
++        sent = 0
++        # ACK-first: do not let a queued file transfer starve pending ACKs.
++        for conn_id in due_ids:
++            if sent >= budget:
++                return sent
++            try:
++                if self.send_ack_once(conn_id):
++                    sent += 1
++            except OSError as exc:
++                if self._log and not self._stopping.is_set():
++                    self._log(f"[UDP] ACK send error conn_id={conn_id:016x}: {exc}")
++        # One datagram per connection per round, repeated while budget lasts.
++        while sent < budget:
++            progressed = False
++            for conn_id in active_ids:
++                if sent >= budget or self._stopping.is_set():
++                    break
++                try:
++                    if self.send_reliable_once(conn_id) is not None:
++                        progressed = True
++                        sent += 1
++                except OSError as exc:
++                    if self._log and not self._stopping.is_set():
++                        self._log(f"[UDP] DATA send error conn_id={conn_id:016x}: {exc}")
++            if not progressed:
++                break
++        return sent
++
+     def serve_once(self) -> None:
+         try:
+             packet, endpoint = self.sock.recvfrom(MAX_UDP_DATAGRAM + 1)
+@@ -318,6 +400,8 @@ class UDPTransportService:
+                 raise
+         else:
+             self.handle_datagram(packet, endpoint)
++        if self.auto_drive and not self._stopping.is_set():
++            self.pump_reliable_once()
+ 
+     def serve_forever(self) -> None:
+         while not self._stopping.is_set():

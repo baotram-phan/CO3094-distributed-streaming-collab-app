@@ -245,6 +245,9 @@ class ReceivedPacketAckTracker:
         self._generation = 0
         self._cursor = 0
         self._ack_pending = False
+        # Earliest time at which the current ACK batch became pending.
+        # Keep this deadline while a multi-range ACK batch is in progress.
+        self._ack_pending_since_ms: float | None = None
 
     @property
     def tracked_count(self) -> int:
@@ -253,6 +256,32 @@ class ReceivedPacketAckTracker:
     @property
     def ack_pending(self) -> bool:
         return self._ack_pending
+
+    @property
+    def ack_pending_since_ms(self) -> float | None:
+        """Earliest unflushed ACK-eliciting receipt, or None when idle."""
+        return self._ack_pending_since_ms
+
+    def ack_due(self, now_ms: float | int, *, max_delay_ms: float = ACK_DELAY_CAP_MS) -> bool:
+        """Whether an ACK should be sent *by now* (no network I/O).
+
+        UDP ACK-only packets never set this deadline. A valid replay request
+        uses its original receipt timestamp, so a lost ACK can be resent
+        promptly. `max_delay_ms` cannot exceed the protocol's 25 ms limit.
+        """
+        now = _clock_ms(now_ms)
+        if type(max_delay_ms) not in (int, float) or not isfinite(max_delay_ms):
+            raise ValueError("max_delay_ms must be a finite number")
+        if not 0 <= max_delay_ms <= ACK_DELAY_CAP_MS:
+            raise ValueError("max_delay_ms must be in 0..25")
+        if not self._ack_pending:
+            return False
+        pending_since = self._ack_pending_since_ms
+        if pending_since is None:
+            raise RuntimeError("ACK pending without a receipt timestamp")
+        if now < pending_since:
+            raise ValueError("ACK clock cannot precede the receipt time")
+        return now - pending_since >= max_delay_ms
 
     def note_received(self, packet_num: int, packet_type: int, received_at_ms: float | int) -> bool:
         """Call for a newly accepted (ReplayWindow.commit=True) packet.
@@ -275,6 +304,10 @@ class ReceivedPacketAckTracker:
         self._received_at = {n: t for n, t in self._received_at.items() if n >= cutoff}
         self._generation += 1
         self._cursor = 0
+        if self._ack_pending_since_ms is None:
+            self._ack_pending_since_ms = stamp
+        else:
+            self._ack_pending_since_ms = min(self._ack_pending_since_ms, stamp)
         self._ack_pending = True
         return True
 
@@ -285,10 +318,15 @@ class ReceivedPacketAckTracker:
         The transport must authenticate and check the endpoint first.
         """
         _packet_number(packet_num)
-        if packet_num not in self._received_at:
+        received_at = self._received_at.get(packet_num)
+        if received_at is None:
             return False
         self._generation += 1
         self._cursor = 0
+        if self._ack_pending_since_ms is None:
+            self._ack_pending_since_ms = received_at
+        else:
+            self._ack_pending_since_ms = min(self._ack_pending_since_ms, received_at)
         self._ack_pending = True
         return True
 
@@ -352,6 +390,7 @@ class ReceivedPacketAckTracker:
         else:
             self._cursor = 0
             self._ack_pending = False
+            self._ack_pending_since_ms = None
         return True
 
 
@@ -688,6 +727,10 @@ class DataRetransmissionQueue:
     @property
     def prepared(self) -> PreparedRetransmission | None:
         return self._prepared
+    
+    def peek_queued_frame(self) -> StreamSendFrame | None:
+        """Read-only head of the resend queue; does NOT allocate a packet number."""
+        return self._queue[0] if self._queue else None
 
     def note_loss(self, lost: LostPacket, sent: SentPacketTracker) -> bool:
         """Queue retransmission after a fresh DATA loss report.

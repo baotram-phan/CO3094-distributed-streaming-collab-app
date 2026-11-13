@@ -200,7 +200,8 @@ def decode_data_body(body: bytes) -> tuple[int, int, int, bytes]:
 
     return stream_id, offset, flags, data
 
-def _validate_ack_ranges(ranges: list[tuple[int, int]]) -> None:
+AckRanges = list[tuple[int, int]] | tuple[tuple[int, int], ...]
+def _validate_ack_ranges(ranges: AckRanges) -> None:
     """Ranges are inclusive, sorted descending, and must not overlap."""
     if not isinstance(ranges, (list, tuple)):
         raise TypeError("ACK ranges must be a list or tuple")
@@ -224,7 +225,7 @@ def _validate_ack_ranges(ranges: list[tuple[int, int]]) -> None:
 
 def encode_ack_body(
     ack_delay_ms: int,
-    ranges: list[tuple[int, int]],
+    ranges: AckRanges,
 ) -> bytes:
     """Encode ACK plaintext body only; not the encrypted UDP packet."""
     if type(ack_delay_ms) is not int or not (0 <= ack_delay_ms <= 65535):
@@ -237,7 +238,7 @@ def encode_ack_body(
     return bytes(body)
 
 
-def decode_ack_body(body: bytes) -> tuple[int, list[tuple[int, int]]]:
+def decode_ack_body(body: bytes) -> tuple[int, AckRanges]:
     """Decode and structurally validate ACK plaintext body."""
     if not isinstance(body, bytes):
         raise TypeError("ACK body must be bytes")
