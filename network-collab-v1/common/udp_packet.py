@@ -22,11 +22,16 @@ from common.crypto import encrypt_payload, decrypt_payload
 
 HEADER_STRUCT = struct.Struct("!HBBQQ")
 DATA_STRUCT = struct.Struct("!IQBH")
+
+# Congestion accounting counts encrypted DATA datagram bytes (not IP/UDP headers).
+DATA_DATAGRAM_OVERHEAD = HEADER_SIZE + GCM_TAG_SIZE + DATA_STRUCT.size
+MAX_DATA_DATAGRAM_BYTES = DATA_DATAGRAM_OVERHEAD + MAX_DATA_PER_PACKET
 ACK_HEADER_STRUCT = struct.Struct("!HB")
 ACK_RANGE_STRUCT = struct.Struct("!QQ")
 MAX_ACK_RANGES = 16
 WINDOW_UPDATE_STRUCT = struct.Struct("!IQ")
 CLOSE_STRUCT = struct.Struct("!H")
+HEARTBEAT_STRUCT = struct.Struct("!Q")  # PING/PONG echo monotonic timestamp_ms
 
 MAX_UINT64 = (1 << 64) - 1
 
@@ -55,8 +60,19 @@ def validate_packet_body(packet_type: int, plaintext: bytes):
         decode_close_body(plaintext)
 
     elif packet_type in (PING, PONG):
-        if len(plaintext) != 8:
-            raise ValueError("PING/PONG body must be 8 bytes")
+        decode_heartbeat_body(plaintext)
+
+def encode_heartbeat_body(timestamp_ms: int) -> bytes:
+    """Protocol v1 PING/PONG body: exact unsigned 64-bit monotonic ms."""
+    validate_uint64(timestamp_ms, "heartbeat timestamp_ms")
+    return HEARTBEAT_STRUCT.pack(timestamp_ms)
+
+
+def decode_heartbeat_body(body: bytes) -> int:
+    if not isinstance(body, bytes) or len(body) != HEARTBEAT_STRUCT.size:
+        raise ValueError("PING/PONG body must be exactly 8 bytes")
+    return HEARTBEAT_STRUCT.unpack(body)[0]
+
 
 def encode_header(packet_type, conn_id, pkt_num):
     if type(packet_type) is not int:

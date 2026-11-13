@@ -10,15 +10,17 @@ from __future__ import annotations
 import socket
 import threading
 import time
+from collections import deque
 
 from cryptography.exceptions import InvalidTag
 
-from common.constants import ACK, HEADER_SIZE, REGISTER, REGISTER_OK, MAX_UDP_DATAGRAM
+from common.constants import ACK, HEADER_SIZE, REGISTER, REGISTER_OK, MAX_UDP_DATAGRAM, PING, PONG
 from common.transport_state import TransportConnectionState
 from common.reliable_receive import ReliableReceiveState, ReceiveResult
 from common.send_scheduler import PreparedScheduledSend
 from common.streams import StreamDelivery
-from common.udp_packet import decode_header, decode_packet, encode_packet
+from common.udp_packet import (decode_header, decode_packet, encode_packet,
+                               encode_heartbeat_body, decode_heartbeat_body)
 
 
 class UDPRegistrationClient:
@@ -61,6 +63,13 @@ class UDPRegistrationClient:
         # One lock serializes all reliable transport changes and UDP sends.
         # register() is synchronous and MUST NOT overlap the reliable phase.
         self._transport_lock = threading.Lock()
+        # B5.2: liveness shares the REGISTER socket, keys, PN and replay bitmap.
+        self.heartbeat_interval_ms = 2000.0
+        self.server_idle_timeout_ms = 10000.0
+        self._next_ping_due_ms: float | None = None
+        self._last_verified_server_ms: float | None = None
+        self._pending_ping_timestamps: deque[int] = deque(maxlen=8)
+        self._last_pong_timestamp_ms: int | None = None
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             self.sock.bind((bind_host, 0))
@@ -120,11 +129,75 @@ class UDPRegistrationClient:
                     self.state.recv_replay.commit(pn)
                     self.registered = True
                     self.reliable_receiver = ReliableReceiveState(self.state)
+                    registered_ms = time.monotonic() * 1000
+                    self._last_verified_server_ms = registered_ms
+                    self._next_ping_due_ms = registered_ms + self.heartbeat_interval_ms
+                    self._pending_ping_timestamps.clear()
                     return self.local_endpoint
                 except (InvalidTag, ValueError, TypeError):
                     continue
 
         raise TimeoutError('No authenticated REGISTER_OK before bootstrap deadline; bootstrap again')
+
+    def send_ping_once(self, *, now_ms: float | None = None) -> bool:
+        """Send one due encrypted keepalive, without creating a timer thread.
+
+        Only the REGISTER/pump owner may call this (not concurrently with the
+        receive/pump loop). Packet number is consumed even if sendto fails.
+        """
+        now = time.monotonic() * 1000 if now_ms is None else float(now_ms)
+        with self._transport_lock:
+            self._require_reliable()
+            due = self._next_ping_due_ms
+            if due is None or now < due:
+                return False
+            timestamp = int(now)
+            body = encode_heartbeat_body(timestamp)
+            pn = self.state.allocate_packet_number()
+            packet = encode_packet(self.c2s_key, PING, self.conn_id, pn, body)
+            sent = self.sock.sendto(packet, self.server_endpoint)
+            if sent != len(packet):
+                raise OSError("UDP sendto returned a partial PING datagram")
+            self._pending_ping_timestamps.append(timestamp)
+            self._next_ping_due_ms = now + self.heartbeat_interval_ms
+            return True
+
+    def _accept_pong(self, packet: bytes, endpoint: tuple[str, int], *, now_ms: float) -> ReceiveResult | None:
+        """Called with _transport_lock held, after basic header routing."""
+        if endpoint != self.server_endpoint:
+            return None
+        try:
+            kind, conn_id, packet_num = decode_header(packet[:HEADER_SIZE])
+            if kind != PONG or conn_id != self.conn_id:
+                return None
+            if not self.state.recv_replay.can_accept(packet_num):
+                return None
+            decoded_kind, decoded_conn, decoded_pn, body = decode_packet(self.s2c_key, packet)
+            if (decoded_kind, decoded_conn, decoded_pn) != (PONG, conn_id, packet_num):
+                return None
+            timestamp = decode_heartbeat_body(body)
+            if timestamp not in self._pending_ping_timestamps:
+                return None  # Authenticated but unsolicited/stale PONG echo.
+            if not self.state.recv_replay.commit(packet_num):
+                return None
+            self._pending_ping_timestamps.remove(timestamp)
+            self._last_pong_timestamp_ms = timestamp
+            self._last_verified_server_ms = now_ms
+            return ReceiveResult(PONG, packet_num)
+        except (InvalidTag, ValueError, TypeError):
+            return None
+
+    def _check_server_liveness(self, *, now_ms: float) -> None:
+        """Stop using expired keys after 10s with no authenticated inbound UDP.
+
+        This is client-side detection; A's Registry independently owns server
+        expiry and sends the close event. Reconnect requires fresh TLS bootstrap.
+        """
+        with self._transport_lock:
+            reference = self._last_verified_server_ms
+        if reference is not None and now_ms - reference >= self.server_idle_timeout_ms:
+            self.close()
+            raise TimeoutError("No authenticated UDP from server for 10s; bootstrap again")
 
     def receive_reliable_once(self, *, timeout_s: float = 0.25) -> ReceiveResult | None:
         """B4.1 receive-only helper. Call from ONE UDP client receive loop.
@@ -144,11 +217,24 @@ class UDPRegistrationClient:
         with self._transport_lock:
             if self._closed or self.reliable_receiver is None:
                 return None
-            return self.reliable_receiver.accept(
+            now_ms = time.monotonic() * 1000
+            # PONG is authenticated and replay-protected in the SAME PN space
+            # as reliable DATA/ACK. It is not an ACK-eliciting DATA frame.
+            if len(packet) >= HEADER_SIZE and endpoint == self.server_endpoint:
+                try:
+                    kind, conn_id, _ = decode_header(packet[:HEADER_SIZE])
+                    if kind == PONG and conn_id == self.conn_id:
+                        return self._accept_pong(packet, endpoint, now_ms=now_ms)
+                except (ValueError, TypeError):
+                    return None
+            outcome = self.reliable_receiver.accept(
                 packet, key=self.s2c_key, endpoint=endpoint,
                 bound_endpoint=self.server_endpoint,
-                now_ms=time.monotonic() * 1000,
+                now_ms=now_ms,
             )
+            if outcome is not None and not outcome.duplicate:
+                self._last_verified_server_ms = now_ms
+            return outcome
 
     def _require_reliable(self) -> ReliableReceiveState:
         if self._closed or not self.registered or self.reliable_receiver is None:
@@ -231,7 +317,9 @@ class UDPRegistrationClient:
         receive_reliable_once(), or another pump. Applications may enqueue
         stream bytes from other threads via queue_reliable_bytes().
 
-        ACKs have priority over DATA/retries. `max_packets` bounds the total
+        ACKs have priority, then due PING, then DATA/retries.
+        The 2s heartbeat does not extend server AUTH deadlines.
+        `max_packets` bounds the total
         datagrams sent by this round; no per-packet thread is created.
         """
         if type(max_packets) is not int or not 1 <= max_packets <= 128:
@@ -245,11 +333,17 @@ class UDPRegistrationClient:
             if self._closed:
                 return None
             raise
+        now_ms = time.monotonic() * 1000
+        self._check_server_liveness(now_ms=now_ms)
         with self._transport_lock:
             receiver = self._require_reliable()
-            due = receiver.timer_tick(now_ms=time.monotonic() * 1000).ack_due
+            due = receiver.timer_tick(now_ms=now_ms).ack_due
         budget = max_packets
         if due and self.send_ack_once():
+            budget -= 1
+        # Heartbeat is a low-volume, periodic control packet. Keep one slot
+        # when due, before a large file transfer could fill the send budget.
+        if budget > 0 and self.send_ping_once(now_ms=time.monotonic() * 1000):
             budget -= 1
         while budget > 0:
             if self.send_reliable_once() is None:

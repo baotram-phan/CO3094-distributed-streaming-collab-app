@@ -21,11 +21,12 @@ from common.cubic import CubicController
 from common.send_scheduler import PreparedScheduledSend
 from common.streams import StreamSendFrame
 from common.transport import AckReceipt, LostPacket, RttEstimator, _clock_ms
+from common.udp_packet import DATA_DATAGRAM_OVERHEAD
 
 
 @dataclass(frozen=True, slots=True)
 class CongestionAckResult:
-    """Frames completed once, and payload bytes eligible for cwnd growth."""
+    """Frames completed once, and DATA datagram bytes eligible for cwnd growth."""
 
     completed_frames: int
     newly_credited_bytes: int
@@ -173,10 +174,11 @@ class CongestionFeedback:
             if acked_pn is None:
                 continue
             counted += 1
+            datagram_bytes = DATA_DATAGRAM_OVERHEAD + len(frame.data)
             if acked_pn <= self._recovery_boundary:
-                suppressed += len(frame.data)
+                suppressed += datagram_bytes
             else:
-                eligible += len(frame.data)
+                eligible += datagram_bytes
             for pn in attempts:
                 del self._attempts[pn]
             del self._by_frame[frame]

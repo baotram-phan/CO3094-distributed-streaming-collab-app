@@ -13,7 +13,7 @@ from typing import Callable
 
 from cryptography.exceptions import InvalidTag
 
-from common.constants import HEADER_SIZE, GCM_TAG_SIZE, MAX_UDP_DATAGRAM, REGISTER, REGISTER_OK, DATA, ACK, WINDOW_UPDATE
+from common.constants import HEADER_SIZE, GCM_TAG_SIZE, MAX_UDP_DATAGRAM, REGISTER, REGISTER_OK, DATA, ACK, WINDOW_UPDATE, PING, PONG
 from common.transport_state import TransportConnectionState
 from common.transport_manager import TransportStateManager
 from common.reliable_receive import ReliableReceiveState, ReceiveResult
@@ -272,6 +272,58 @@ class UDPTransportService:
 
         return True
 
+    def _handle_heartbeat_ping(
+        self, packet: bytes, endpoint: tuple[str, int], conn_id: int, packet_num: int,
+    ) -> bool:
+        """Authenticate one fresh client PING and echo its exact timestamp.
+
+        B never closes or touches A sessions under the transport lock.  A's
+        coordinator alone drains close events.  PONG is not ACK-eliciting and
+        does not enter the DATA/window congestion tracker.
+        """
+        session = self._bound_session_for_send(conn_id)  # Registry OUTSIDE lock
+        if session is None or session.udp_endpoint != endpoint:
+            return False
+
+        with self._lifecycle_lock:
+            if self._stopping.is_set() or conn_id in self._closed_conn_ids:
+                return False
+            receiver = self._reliable.get(conn_id)
+            if receiver is None or not receiver.connection.recv_replay.can_accept(packet_num):
+                return False
+            # Decode *before* committing replay. Invalid AEAD/body never
+            # updates liveness or consumes a packet number.
+            try:
+                kind, decoded_conn, decoded_pn, body = decode_packet(session.c2s_key, packet)
+            except (InvalidTag, ValueError, TypeError):
+                return False
+            if (kind, decoded_conn, decoded_pn) != (PING, conn_id, packet_num):
+                return False
+            if not receiver.connection.recv_replay.commit(packet_num):
+                return False
+
+        # Verified, fresh PING from bound endpoint is activity, but it cannot
+        # extend the independent AUTH deadline (owned by SessionRegistry).
+        try:
+            self.registry.touch_verified_udp(conn_id, endpoint)
+        except SessionError:
+            return False
+        # Recheck A close/expiry before using the session key to send.
+        if self._bound_session_for_send(conn_id) is None:
+            return False
+        with self._lifecycle_lock:
+            if (self._stopping.is_set() or conn_id in self._closed_conn_ids
+                    or conn_id not in self._reliable):
+                return False
+            # Same server packet-number space as REGISTER_OK, ACK and DATA.
+            reply_pn = receiver.connection.allocate_packet_number()
+            reply = encode_packet(session.s2c_key, PONG, conn_id, reply_pn, body)
+            try:
+                size = self.sock.sendto(reply, endpoint)
+            except OSError:
+                return True  # A valid PING; next periodic PING retries liveness.
+            return size == len(reply)
+
     def handle_datagram(self, packet: bytes, endpoint: tuple[str, int]) -> bool:
         """Handle one datagram in the SINGLE receive loop, True iff accepted.
 
@@ -285,6 +337,8 @@ class UDPTransportService:
             packet_type, conn_id, pkt_num = decode_header(packet[:HEADER_SIZE])
             if packet_type in (DATA, ACK, WINDOW_UPDATE):
                 return self._handle_reliable_datagram(packet, endpoint, conn_id)
+            if packet_type == PING:
+                return self._handle_heartbeat_ping(packet, endpoint, conn_id, pkt_num)
             if packet_type != REGISTER:
                 return False
             session = self.registry.get(conn_id)

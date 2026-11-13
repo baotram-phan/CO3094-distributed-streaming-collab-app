@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 from cryptography.exceptions import InvalidTag
 
-from common.constants import ACK, DATA, WINDOW_UPDATE, HEADER_SIZE, GCM_TAG_SIZE, MAX_UDP_DATAGRAM, MAX_DATA_PER_PACKET
+from common.constants import ACK, DATA, WINDOW_UPDATE, HEADER_SIZE, GCM_TAG_SIZE, MAX_UDP_DATAGRAM
 from common.cubic import CubicController
 from common.congestion_feedback import CongestionFeedback
 from common.send_scheduler import ConnectionSendScheduler, PreparedScheduledSend
@@ -25,7 +25,7 @@ from common.transport import (
     ReceivedPacketAckTracker, RttEstimator, SentPacketTracker, LostPacket, _clock_ms,
 )
 from common.transport_state import TransportConnectionState
-from common.udp_packet import DATA_STRUCT, decode_data_body, decode_header, decode_packet
+from common.udp_packet import MAX_DATA_DATAGRAM_BYTES, decode_data_body, decode_header, decode_packet
 from common.window_update_flow import WindowUpdateFlow
 
 
@@ -85,7 +85,7 @@ class ReliableReceiveState:
         self.rtt = RttEstimator()
         self.loss = PacketLossDetector()
         # One CUBIC and one scheduler per ConnID; never reset on REGISTER retry.
-        self.cubic = CubicController(mss_bytes=1024)
+        self.cubic = CubicController(mss_bytes=MAX_DATA_DATAGRAM_BYTES)
         self.congestion = CongestionFeedback(self.cubic)
         self.scheduler = ConnectionSendScheduler(
             self.streams, self.connection, self.sent, self.retries, self.flow
@@ -150,16 +150,10 @@ class ReliableReceiveState:
         """
         if not self.congestion.can_note_sent():
             return None  # bounded DATA attempt accounting; never silently drop
-        cwnd_budget = self.cubic.cwnd_bytes
-        # CUBIC's mss_bytes=1024 describes the largest DATA *payload*.
-        # B's scheduler accounts full encrypted datagram bytes (payload + 51 B).
-        # After RTO, CUBIC returns to one payload MSS; if nothing is in flight,
-        # permit one wire-sized DATA probe so an exact 1024-B DATA retry cannot
-        # deadlock forever. Do not increase CUBIC itself or allow multiple probes.
-        if self.sent.bytes_in_flight == 0:
-            max_data_wire_bytes = HEADER_SIZE + GCM_TAG_SIZE + DATA_STRUCT.size + MAX_DATA_PER_PACKET
-            cwnd_budget = max(cwnd_budget, max_data_wire_bytes)
-        return self.scheduler.prepare_next(key, now_ms=now_ms, cwnd_bytes=cwnd_budget)
+        # No RTO probe exception: congestion MSS and DATA wire size now agree.
+        return self.scheduler.prepare_next(
+            key, now_ms=now_ms, cwnd_bytes=self.cubic.cwnd_bytes,
+        )
 
     def commit_send(self, plan: PreparedScheduledSend) -> None:
         """Commit after a full successful socket send, then record DATA attempt."""

@@ -23,10 +23,10 @@ from common.transport import (
     SentPacketTracker, _clock_ms,
 )
 from common.transport_state import TransportConnectionState
-from common.udp_packet import DATA_STRUCT, encode_data_body, encode_packet
+from common.udp_packet import DATA_DATAGRAM_OVERHEAD, encode_data_body, encode_packet
 from common.window_update_flow import PreparedWindowUpdate, WindowUpdateFlow
 
-_DATA_OVERHEAD = HEADER_SIZE + GCM_TAG_SIZE + DATA_STRUCT.size  # 51 B
+_DATA_OVERHEAD = DATA_DATAGRAM_OVERHEAD  # 51 B; common wire-size accounting
 _WU_SIZE = HEADER_SIZE + GCM_TAG_SIZE + 12  # 48 B
 
 
