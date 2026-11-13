@@ -1,5 +1,5 @@
-"""[TODO - Owner A] Điểm vào client chính; UI hoặc CLI.
+"""CLI entry point for the live collaboration demo."""
+from client.cli import main
 
-File này là SƯỜN; chưa có chức năng chạy thực tế.
-Vui lòng xem docs/TEAM_OWNERSHIP.md và docs/INTERFACES.md.
-"""
+if __name__ == "__main__":
+    main()

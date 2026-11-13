@@ -1,4 +1,4 @@
-"""A1.5 unified TLS bootstrap + B's real UDP codec in ONE server process."""
+"""A/B live server: TLS bootstrap, reliable UDP dispatch, AUTH and chat."""
 from __future__ import annotations
 
 import argparse
@@ -14,6 +14,7 @@ from server.sessions import SessionRegistry, SessionClosedEvent
 from server.udp_service import UDPTransportService
 from server.a16_auth_service import A16AuthService
 from server.a17_chat_service import A17ChatService
+from server.reliable_dispatcher import bind_application_bridge
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -22,12 +23,13 @@ class CollaborationServer:
                  udp_port: int = 9001, cert: Path | None = None,
                  key: Path | None = None, registry: SessionRegistry | None = None,
                  logger=print, on_udp_registered=None, on_session_closed=None,
-                 send_reliable_control=None, send_reliable_chat=None) -> None:
+                 send_reliable_control=None, send_reliable_chat=None,
+                 enable_reliable_bridge: bool = True) -> None:
         self.registry = registry if registry is not None else SessionRegistry()
         self.logger = logger
         self.on_session_closed = on_session_closed
-        # A1.6 AUTH is DISABLED until B supplies a genuine reliable UDP stream-0
-        # sender. Never route AUTH over the TLS/bootstrap socket or raw UDP.
+        # The B4.4.2 bridge attaches real reliable senders after UDP init.
+        # Never route AUTH via the TLS/bootstrap socket or raw UDP.
         self.auth_service = (
             A16AuthService(self.registry, send_reliable_control)
             if send_reliable_control is not None else None
@@ -50,12 +52,27 @@ class CollaborationServer:
             self.udp_service = UDPTransportService(
                 self.registry, host=host, port=udp_port,
                 logger=logger, on_udp_registered=on_udp_registered,
+                auto_drive=enable_reliable_bridge,
             )
         except Exception:
             self.tcp_sock.close()
             raise
         self.tcp_port = self.tcp_sock.getsockname()[1]
         self.udp_port = self.udp_service.port
+        # B4.4.2 application dispatch happens on dedicated transport workers.
+        self.delivery_dispatcher = (
+            bind_application_bridge(
+                self, on_reliable_delivery_failed=self.on_reliable_delivery_failed,
+            ) if enable_reliable_bridge else None
+        )
+
+    def on_reliable_delivery_failed(self, conn_id: int, stream_id: int,
+                                    offset: int, code: str) -> None:
+        """A policy: fail-close, with close-event draining only at coordinator."""
+        if self.logger:
+            self.logger(f"[APP] delivery failure conn_id={conn_id:016x} "
+                        f"stream_id={stream_id} offset={offset} code={code}")
+        self.registry.close(conn_id, reason="app_delivery_failure")
 
     def _handle_tls(self, raw: socket.socket, peer: tuple[str, int]) -> None:
         try:
@@ -148,6 +165,8 @@ class CollaborationServer:
         udp_thread = threading.Thread(target=self.udp_service.serve_forever, daemon=True)
         udp_thread.start()
         try:
+            if self.delivery_dispatcher is not None:
+                self.delivery_dispatcher.start()
             while not self.stop_event.is_set():
                 try:
                     raw, peer = self.tcp_sock.accept()
@@ -170,21 +189,30 @@ class CollaborationServer:
 
     def stop(self) -> None:
         self.stop_event.set()
+        if self.delivery_dispatcher is not None:
+            self.delivery_dispatcher.stop()
         self.tcp_sock.close()
         self.udp_service.stop()
         self.dispatch_closed_events()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='A1.5: TLS + B UDP REGISTER integration')
+    parser = argparse.ArgumentParser(description='TLS + Reliable UDP AUTH/Chat server')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--tcp-port', type=int, default=9000)
     parser.add_argument('--udp-port', type=int, default=9001)
     parser.add_argument('--cert', type=Path, default=ROOT / 'certs/server.crt')
     parser.add_argument('--key', type=Path, default=ROOT / 'certs/server.key')
+    parser.add_argument('--idle-timeout-s', type=float, default=10.0,
+                        help='Default 10 s per protocol; increase ONLY for manual demo until B adds heartbeat')
     args = parser.parse_args()
+    if args.idle_timeout_s <= 0:
+        parser.error('--idle-timeout-s must be positive')
+    if args.idle_timeout_s != 10.0:
+        print('[DEMO WARNING] Non-standard idle timeout; protocol requires 10s + heartbeat')
     srv = CollaborationServer(host=args.host, tcp_port=args.tcp_port,
-                              udp_port=args.udp_port, cert=args.cert, key=args.key)
+                              udp_port=args.udp_port, cert=args.cert, key=args.key,
+                              registry=SessionRegistry(idle_timeout_s=args.idle_timeout_s))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

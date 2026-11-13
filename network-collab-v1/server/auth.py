@@ -14,15 +14,21 @@ USERS_FILE = (
 
 
 def verify_password(username, password):
+    """Fail closed on missing/corrupt local accounts; never log passwords."""
+    if not isinstance(username, str) or not isinstance(password, str):
+        return False
+    # Account file is local server configuration, never sent to the client.
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            users = json.load(f)
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return False
+    if not isinstance(users, dict):
+        return False
 
-    # Bước 1: Đọc thông tin tài khoản
-    with open(USERS_FILE, "r", encoding="utf-8") as f:
-        users = json.load(f)
-
-    # Bước 2: Tìm username
     user_data = users.get(username)
 
-    if user_data is None:
+    if not isinstance(user_data, dict):
         return False
 
     # Bước 3: Lấy salt, hash và iterations
