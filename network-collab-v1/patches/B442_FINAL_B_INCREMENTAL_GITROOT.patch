@@ -1,0 +1,375 @@
+diff --git a/network-collab-v1/server/reliable_dispatcher.py b/network-collab-v1/server/reliable_dispatcher.py
+index a82249f..ea3a33e 100644
+--- a/network-collab-v1/server/reliable_dispatcher.py
++++ b/network-collab-v1/server/reliable_dispatcher.py
+@@ -7,12 +7,13 @@ Application code runs outside UDP/Registry locks and outside the receive loop.
+ A callback returning True means it has safely accepted all bytes (including a
+ partial application frame). A False result is *not* accepted; an exception may
+ have produced side effects before failing. Therefore neither case is retried
+-automatically. A must decide whether to resume a rejected delivery or close the
+-session. B never drains Registry close events and never calls Registry.close().
++automatically. The A coordinator closes the session on rejection or exception;
++B never drains Registry close events and never calls Registry.close().
+ """
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
++import logging
+ import threading
+ from typing import Callable, TYPE_CHECKING
+ 
+@@ -24,7 +25,7 @@ if TYPE_CHECKING:
+ 
+ 
+ ApplicationCallback = Callable[[int, int, int, bytes, bool], bool]
+-FailureCallback = Callable[[int, str], None]
++FailureCallback = Callable[[int, int, int, str], None]
+ 
+ APPLICATION_REJECTED = "APPLICATION_REJECTED"
+ APPLICATION_EXCEPTION = "APPLICATION_EXCEPTION"
+@@ -35,16 +36,16 @@ DISPATCHER_EXCEPTION = "DISPATCHER_EXCEPTION"
+ @dataclass(slots=True)
+ class _PendingDelivery:
+     delivery: StreamDelivery
+-    # 'active' (first try / explicitly resumed), 'rejected', or 'failed'.
++    # 'active' (first attempt), 'rejected', or 'failed'.
+     status: str = "active"
+ 
+ 
+ class ReliableDeliveryDispatcher:
+     """Bounded, per-ConnID-ordered A callback dispatcher for a B UDP service.
+ 
+-    - No application callback or on_failure is invoked under a transport lock.
++    - No application callback or failure hook is invoked under a transport lock.
+     - Callback False pauses *that ConnID* with one retained delivery. No credit.
+-      Explicit `resume_rejected(conn_id)` requires an application decision.
++      A coordinator is notified and is responsible for closing the session.
+     - Callback exception freezes that ConnID and emits failure once. It never
+       retries automatically because the callback may have committed side effects.
+     - The Registry/A coordinator owns session close and closed-event draining.
+@@ -55,15 +56,15 @@ class ReliableDeliveryDispatcher:
+         udp_service: UDPTransportService,
+         on_data: ApplicationCallback,
+         *,
+-        on_failure: FailureCallback | None = None,
++        on_reliable_delivery_failed: FailureCallback | None = None,
+         worker_count: int = 4,
+         poll_interval_s: float = 0.01,
+         max_callbacks_per_poll: int = 64,
+     ) -> None:
+         if not callable(on_data):
+             raise TypeError("on_data must be callable")
+-        if on_failure is not None and not callable(on_failure):
+-            raise TypeError("on_failure must be callable")
++        if on_reliable_delivery_failed is not None and not callable(on_reliable_delivery_failed):
++            raise TypeError("on_reliable_delivery_failed must be callable")
+         if type(worker_count) is not int or not 1 <= worker_count <= 16:
+             raise ValueError("worker_count must be 1..16")
+         if not isinstance(poll_interval_s, (int, float)) or not 0 < poll_interval_s <= 0.1:
+@@ -72,7 +73,7 @@ class ReliableDeliveryDispatcher:
+             raise ValueError("max_callbacks_per_poll must be 1..256")
+         self.udp_service = udp_service
+         self.on_data = on_data
+-        self.on_failure = on_failure
++        self.on_reliable_delivery_failed = on_reliable_delivery_failed
+         self.worker_count = worker_count
+         self.poll_interval_s = float(poll_interval_s)
+         self.max_callbacks_per_poll = max_callbacks_per_poll
+@@ -113,36 +114,38 @@ class ReliableDeliveryDispatcher:
+             pending = self._pending.get(conn_id)
+             return pending.status if pending is not None else None
+ 
+-    def resume_rejected(self, conn_id: int) -> bool:
+-        """Explicitly retry a False delivery ONLY after A decides it is safe.
++    def _notify(self, conn_id: int, delivery: StreamDelivery, code: str) -> None:
++        """Notify A with the *original* delivery coordinates, outside all locks.
+ 
+-        A failed callback (exception) is intentionally not resumable, because
+-        an exception does not prove whether the application committed effects.
++        Errors in A's notification hook cannot turn a failed application
++        callback into an automatic retry. Log them for observability.
+         """
+-        with self._state_lock:
+-            pending = self._pending.get(conn_id)
+-            if pending is None or pending.status != "rejected" or self._stop.is_set():
+-                return False
+-            pending.status = "active"
+-            return True
+-
+-    def _notify(self, conn_id: int, reason: str) -> None:
+-        if self.on_failure is None:
++        if self.on_reliable_delivery_failed is None:
++            logging.getLogger(__name__).error(
++                "Reliable delivery failed without a coordinator hook: "
++                "conn_id=%016x stream_id=%d offset=%d code=%s",
++                conn_id, delivery.stream_id, delivery.offset, code,
++            )
+             return
+         try:
+-            self.on_failure(conn_id, reason)
++            self.on_reliable_delivery_failed(
++                conn_id, delivery.stream_id, delivery.offset, code,
++            )
+         except Exception:
+-            # A failure handler cannot kill the shared worker or trigger
+-            # automatic replay of application side effects.
+-            pass
++            logging.getLogger(__name__).exception(
++                "A delivery-failure hook raised: conn_id=%016x stream_id=%d offset=%d code=%s",
++                conn_id, delivery.stream_id, delivery.offset, code,
++            )
+ 
+-    def _mark_failed(self, conn_id: int, reason: str, status: str) -> None:
++    def _mark_failed(self, conn_id: int, code: str, status: str) -> None:
+         with self._state_lock:
+             pending = self._pending.get(conn_id)
+             if pending is None or pending.status != "active":
+                 return
+             pending.status = status
+-        self._notify(conn_id, reason)
++            delivery = pending.delivery
++        # This must stay outside _state_lock, transport and Registry locks.
++        self._notify(conn_id, delivery, code)
+ 
+     def _drop(self, conn_id: int) -> None:
+         with self._state_lock:
+@@ -181,6 +184,10 @@ class ReliableDeliveryDispatcher:
+         except Exception:
+             # No automatic retry: AUTH/Chat may have modified app state or
+             # enqueued a reply BEFORE the exception was raised.
++            logging.getLogger(__name__).exception(
++                "Application callback raised conn_id=%016x stream_id=%d offset=%d",
++                conn_id, delivery.stream_id, delivery.offset,
++            )
+             self._mark_failed(conn_id, APPLICATION_EXCEPTION, "failed")
+             return True
+ 
+@@ -239,7 +246,7 @@ class ReliableDeliveryDispatcher:
+             except Exception:
+                 # Only unexpected dispatcher/runtime errors arrive here.
+                 # This worker remains alive; failure is observable through the
+-                # hook when a pending ConnID exists in the affected shard.
++                # 4-argument hook when a pending ConnID exists in the affected shard.
+                 with self._state_lock:
+                     affected = [cid for cid in self._pending if cid % self.worker_count == index]
+                 for conn_id in affected:
+@@ -250,7 +257,7 @@ class ReliableDeliveryDispatcher:
+ def bind_application_bridge(
+     server: CollaborationServer,
+     *,
+-    on_failure: FailureCallback | None = None,
++    on_reliable_delivery_failed: FailureCallback | None = None,
+     worker_count: int = 4,
+ ) -> ReliableDeliveryDispatcher:
+     """Connect A's stream-0/1 sender hooks to B's reliable *enqueue* APIs.
+@@ -269,5 +276,5 @@ def bind_application_bridge(
+         )
+     return ReliableDeliveryDispatcher(
+         server.udp_service, server.on_reliable_stream_data,
+-        on_failure=on_failure, worker_count=worker_count,
++        on_reliable_delivery_failed=on_reliable_delivery_failed, worker_count=worker_count,
+     )
+diff --git a/network-collab-v1/tests/test_b442_delivery_dispatcher.py b/network-collab-v1/tests/test_b442_delivery_dispatcher.py
+index dd03be7..793c512 100644
+--- a/network-collab-v1/tests/test_b442_delivery_dispatcher.py
++++ b/network-collab-v1/tests/test_b442_delivery_dispatcher.py
+@@ -93,7 +93,7 @@ class DispatcherUnitTests(unittest.TestCase):
+     def start(self, callback, *, worker_count=2):
+         dispatcher = ReliableDeliveryDispatcher(
+             self.udp, callback, worker_count=worker_count,
+-            poll_interval_s=0.005, on_failure=lambda cid, reason: self.failures.append((cid, reason)),
++            poll_interval_s=0.005, on_reliable_delivery_failed=lambda cid, sid, off, code: self.failures.append((cid, sid, off, code)),
+         )
+         self.dispatchers.append(dispatcher)
+         dispatcher.start()
+@@ -115,21 +115,19 @@ class DispatcherUnitTests(unittest.TestCase):
+         time.sleep(0.045)
+         self.assertEqual(len(calls), 1)
+         self.assertEqual(self.udp.confirmations, [])
+-        self.assertEqual(self.failures, [(5, APPLICATION_REJECTED)])
++        self.assertEqual(self.failures, [(5, 0, 0, APPLICATION_REJECTED)])
+         self.assertEqual(len(self.udp.queues[5]), 1)
+ 
+-    def test_explicit_resume_after_false(self):
++    def test_rejection_cannot_be_explicitly_retried_in_this_contract(self):
+         self.udp.add(5, StreamDelivery(1, 0, b'abc'))
+-        n = [0]
+-        def cb(*args):
+-            n[0] += 1
+-            return n[0] == 2
+-        d = self.start(cb)
++        calls = []
++        d = self.start(lambda *args: calls.append(args) or False)
+         self.assertTrue(eventually(lambda: d.pending_status(5) == 'rejected'))
+-        self.assertTrue(d.resume_rejected(5))
+-        self.assertTrue(eventually(lambda: self.udp.confirmations == [(5, 1, 3)]))
+-        self.assertEqual(n[0], 2)
+-        self.assertFalse(d.resume_rejected(5))
++        self.assertFalse(hasattr(d, 'resume_rejected'))
++        time.sleep(0.05)
++        self.assertEqual(len(calls), 1)
++        self.assertEqual(self.failures, [(5, 1, 0, APPLICATION_REJECTED)])
++        self.assertEqual(self.udp.confirmations, [])
+ 
+     def test_exception_is_fail_stop_even_with_side_effects(self):
+         self.udp.add(3, StreamDelivery(0, 0, b'auth'))
+@@ -142,8 +140,8 @@ class DispatcherUnitTests(unittest.TestCase):
+         time.sleep(0.04)
+         self.assertEqual(side_effects, ['committed'])
+         self.assertEqual(self.udp.confirmations, [])
+-        self.assertEqual(self.failures, [(3, APPLICATION_EXCEPTION)])
+-        self.assertFalse(d.resume_rejected(3))
++        self.assertEqual(self.failures, [(3, 0, 0, APPLICATION_EXCEPTION)])
++        self.assertFalse(hasattr(d, 'resume_rejected'))
+ 
+     def test_finite_delivery_does_not_credit_new_bytes(self):
+         self.udp.add(8, StreamDelivery(1, 8, b'', True))
+@@ -184,7 +182,7 @@ class DispatcherUnitTests(unittest.TestCase):
+         self.assertTrue(eventually(lambda: d.pending_status(4) == 'failed'))
+         time.sleep(0.035)
+         self.assertEqual(count, [1])
+-        self.assertEqual(self.failures, [(4, CONSUMPTION_CONFIRM_FAILED)])
++        self.assertEqual(self.failures, [(4, 1, 10, CONSUMPTION_CONFIRM_FAILED)])
+ 
+     def test_callback_runs_outside_transport_lock_in_worker_thread(self):
+         self.udp.add(7, StreamDelivery(0, 0, b'hello'))
+@@ -221,7 +219,7 @@ class DispatcherUnitTests(unittest.TestCase):
+         self.udp.remove_connection(9)
+         self.assertTrue(eventually(lambda: d.pending_status(9) is None))
+         d.stop()
+-        self.assertFalse(d.resume_rejected(9))
++        self.assertIsNone(d.pending_status(9))
+ 
+     def test_failure_handler_exception_does_not_kill_shared_worker(self):
+         self.udp.add(6, StreamDelivery(1, 0, b'x'))
+@@ -230,7 +228,7 @@ class DispatcherUnitTests(unittest.TestCase):
+             return cid == 8
+         d = ReliableDeliveryDispatcher(self.udp, cb, worker_count=1,
+                                         poll_interval_s=.005,
+-                                        on_failure=lambda *_: (_ for _ in ()).throw(RuntimeError()))
++                                        on_reliable_delivery_failed=lambda *_: (_ for _ in ()).throw(RuntimeError()))
+         self.dispatchers.append(d)
+         d.start()
+         self.assertTrue(eventually(lambda: (8, 1, 1) in self.udp.confirmations))
+@@ -262,6 +260,65 @@ class DispatcherUnitTests(unittest.TestCase):
+         self.assertEqual((a.auth_service, a.chat_service), prev)
+         d.stop()
+ 
++    def test_failure_hook_has_original_stream_and_nonzero_offset(self):
++        self.udp.add(16, StreamDelivery(3, 2048, b'file-part'))
++        d = self.start(lambda *_: False)
++        self.assertTrue(eventually(lambda: self.failures))
++        self.assertEqual(self.failures, [(16, 3, 2048, APPLICATION_REJECTED)])
++        self.assertEqual(d.pending_status(16), 'rejected')
++        self.assertEqual(self.udp.confirmations, [])
++
++    def test_business_rejection_can_return_true_and_grant_credit(self):
++        # AUTH_FAIL/CHAT_ERROR is a valid business response, not necessarily
++        # a failure to safely accept and buffer application bytes.
++        self.udp.add(16, StreamDelivery(0, 4, b'bad-password'))
++        self.start(lambda *_: True)
++        self.assertTrue(eventually(lambda: self.udp.confirmations))
++        self.assertEqual(self.udp.confirmations, [(16, 0, 16)])
++        self.assertEqual(self.failures, [])
++
++    def test_truthy_non_boolean_result_does_not_confirm(self):
++        self.udp.add(16, StreamDelivery(1, 0, b'a'))
++        d = self.start(lambda *_: 1)
++        self.assertTrue(eventually(lambda: d.pending_status(16) == 'rejected'))
++        self.assertEqual(self.failures, [(16, 1, 0, APPLICATION_REJECTED)])
++        self.assertEqual(self.udp.confirmations, [])
++
++    def test_failure_notification_not_under_state_or_transport_lock(self):
++        self.udp.add(20, StreamDelivery(1, 10, b'hi'))
++        lock_status = []
++        def failure(cid, sid, off, code):
++            a = self.udp.lock.acquire(blocking=False)
++            if a:
++                self.udp.lock.release()
++            b = d._state_lock.acquire(blocking=False)
++            if b:
++                d._state_lock.release()
++            lock_status.append((a, b, cid, sid, off, code))
++        d = ReliableDeliveryDispatcher(
++            self.udp, lambda *_: False,
++            on_reliable_delivery_failed=failure, poll_interval_s=.005,
++        )
++        self.dispatchers.append(d)
++        d.start()
++        self.assertTrue(eventually(lambda: lock_status))
++        self.assertEqual(lock_status, [(True, True, 20, 1, 10, APPLICATION_REJECTED)])
++
++    def test_sender_failure_after_side_effect_not_replayed_and_reports_coordinates(self):
++        self.udp.add(21, StreamDelivery(0, 7, b'auth-data'),
++                     StreamDelivery(0, 16, b'later'))
++        seen = []
++        def callback(cid, sid, off, data, fin):
++            seen.append((off, data))
++            raise OSError('send failed after application accepted and acted')
++        d = self.start(callback)
++        self.assertTrue(eventually(lambda: d.pending_status(21) == 'failed'))
++        time.sleep(.035)
++        self.assertEqual(seen, [(7, b'auth-data')])
++        self.assertEqual(self.failures, [(21, 0, 7, APPLICATION_EXCEPTION)])
++        self.assertEqual(self.udp.confirmations, [])
++        self.assertEqual(len(self.udp.queues[21]), 1)
++
+     def test_validation(self):
+         for kwargs in [{'worker_count': 0}, {'worker_count': 17},
+                        {'poll_interval_s': 0}, {'poll_interval_s': .3},
+@@ -351,6 +408,55 @@ class RealUdpDispatchTests(unittest.TestCase):
+         self.assertTrue(eventually(lambda: rx.flow.pending_stream_ids == (0,)))
+         self.assertEqual(callback_deliveries, [(0, b'abcdef')])
+ 
++    def test_real_udp_false_reports_4_fields_and_A_coordinator_closes(self):
++        fail_events = []
++        delivered = []
++        def on_failed(cid, sid, off, code):
++            fail_events.append((cid, sid, off, code))
++            # A-only policy; B's dispatcher itself NEVER invokes Registry.close.
++            self.registry.close(cid, reason='app_delivery_failure')
++        self.dispatcher = ReliableDeliveryDispatcher(
++            self.server,
++            lambda *args: delivered.append(args) or False,
++            on_reliable_delivery_failed=on_failed, poll_interval_s=.005,
++        )
++        self.dispatcher.start()
++        rx = self.server.get_reliable_receiver(self.cid)
++        assert rx is not None
++        self.send(1, 0, 0, b'auth-failure')
++        self.assertTrue(eventually(lambda: fail_events))
++        self.assertEqual(fail_events, [(self.cid, 0, 0, APPLICATION_REJECTED)])
++        self.assertEqual(len(delivered), 1)
++        self.assertIsNone(self.registry.get(self.cid))
++        self.assertEqual(rx.flow.pending_stream_ids, ())
++        events = self.registry.drain_closed_events()  # A coordinator owns this.
++        self.assertTrue(any(e.conn_id == self.cid for e in events))
++        for event in events:
++            self.server.remove_connection(event.conn_id)
++        self.assertTrue(eventually(lambda: self.dispatcher.pending_status(self.cid) is None))
++        self.assertIsNone(self.server.get_reliable_receiver(self.cid))
++
++    def test_real_udp_false_pauses_without_A_coordinator_intervention(self):
++        failed = []
++        delivered = []
++        self.dispatcher = ReliableDeliveryDispatcher(
++            self.server,
++            lambda *args: delivered.append(args) or False,
++            on_reliable_delivery_failed=lambda *args: failed.append(args),
++            poll_interval_s=.005,
++        )
++        self.dispatcher.start()
++        rx = self.server.get_reliable_receiver(self.cid)
++        assert rx is not None
++        self.send(1, 1, 0, b'hello')
++        self.assertTrue(eventually(lambda: self.dispatcher.pending_status(self.cid) == 'rejected'))
++        self.send(2, 1, 5, b'world')
++        time.sleep(.045)
++        self.assertEqual(len(delivered), 1)
++        self.assertEqual(len(failed), 1)
++        self.assertEqual(failed[0], (self.cid, 1, 0, APPLICATION_REJECTED))
++        self.assertEqual(rx.flow.pending_stream_ids, ())
++
+     def test_real_udp_close_during_callback_without_confirm(self):
+         def cb(cid, sid, off, data, fin):
+             self.registry.close(cid, reason='app_closed')

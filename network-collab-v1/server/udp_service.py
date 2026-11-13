@@ -87,6 +87,19 @@ class UDPTransportService:
                     and live.state in (SessionState.UDP_BOUND, SessionState.ONLINE)
                     and live.udp_endpoint == endpoint)
 
+    def is_delivery_connection_active(self, conn_id: int) -> bool:
+        """Check a live bound session without holding a transport lock during Registry.get.
+
+        Used by B4.4.2 immediately before/after A's application callback.
+        The callback itself still must tolerate concurrent A session closure.
+        """
+        if self._bound_session_for_send(conn_id) is None:
+            return False
+        with self._lifecycle_lock:
+            return (not self._stopping.is_set()
+                    and conn_id not in self._closed_conn_ids
+                    and conn_id in self._reliable)
+
     def get_reliable_receiver(self, conn_id: int) -> ReliableReceiveState | None:
         """For the later A worker bridge; do not mutate it concurrently with UDP."""
         with self._lifecycle_lock:

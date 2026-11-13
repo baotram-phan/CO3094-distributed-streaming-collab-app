@@ -1,0 +1,64 @@
+diff --git a/network-collab-v1/server/main.py b/network-collab-v1/server/main.py
+index 5566cf6..9093083 100644
+--- a/network-collab-v1/server/main.py
++++ b/network-collab-v1/server/main.py
+@@ -14,6 +14,7 @@ from server.sessions import SessionRegistry, SessionClosedEvent
+ from server.udp_service import UDPTransportService
+ from server.a16_auth_service import A16AuthService
+ from server.a17_chat_service import A17ChatService
++from server.reliable_dispatcher import bind_application_bridge
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ 
+@@ -51,12 +52,34 @@ class CollaborationServer:
+             self.udp_service = UDPTransportService(
+                 self.registry, host=host, port=udp_port,
+                 logger=logger, on_udp_registered=on_udp_registered,
++                auto_drive=True,  # B4.3 reliable ACK/RTO/scheduler pump
+             )
+         except Exception:
+             self.tcp_sock.close()
+             raise
+         self.tcp_port = self.tcp_sock.getsockname()[1]
+         self.udp_port = self.udp_service.port
++        # B4.4.2: attach encrypted stream-0/1 enqueue hooks, then build the
++        # dispatcher. A still owns AUTH/chat callbacks and Registry lifetime.
++        self.delivery_dispatcher = bind_application_bridge(
++            self, on_reliable_delivery_failed=self.on_reliable_delivery_failed,
++        )
++
++    def on_reliable_delivery_failed(
++        self, conn_id: int, stream_id: int, offset: int, code: str
++    ) -> None:
++        """A-owned policy: close failed delivery sessions; B only notifies.
++
++        Business-level AUTH_FAIL/CHAT_ERROR are NOT delivery failures when
++        their bytes were safely accepted by the application callback.
++        The coordinator alone drains close events and removes UDP state.
++        """
++        if self.logger:
++            self.logger(
++                f"[APP] Reliable delivery failed conn_id={conn_id:016x} "
++                f"stream_id={stream_id} offset={offset} code={code}"
++            )
++        self.registry.close(conn_id, reason="app_delivery_failure")
+ 
+     def _handle_tls(self, raw: socket.socket, peer: tuple[str, int]) -> None:
+         try:
+@@ -149,6 +172,8 @@ class CollaborationServer:
+         udp_thread = threading.Thread(target=self.udp_service.serve_forever, daemon=True)
+         udp_thread.start()
+         try:
++            # Fixed worker pool, not callbacks inside the UDP receive loop.
++            self.delivery_dispatcher.start()
+             while not self.stop_event.is_set():
+                 try:
+                     raw, peer = self.tcp_sock.accept()
+@@ -171,6 +196,7 @@ class CollaborationServer:
+ 
+     def stop(self) -> None:
+         self.stop_event.set()
++        self.delivery_dispatcher.stop()
+         self.tcp_sock.close()
+         self.udp_service.stop()
+         self.dispatch_closed_events()

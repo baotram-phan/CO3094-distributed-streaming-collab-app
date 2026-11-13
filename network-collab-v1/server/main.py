@@ -12,7 +12,8 @@ from common.tls import server_context
 from server.bootstrap import handle_bootstrap
 from server.sessions import SessionRegistry, SessionClosedEvent
 from server.udp_service import UDPTransportService
-
+from server.a16_auth_service import A16AuthService
+from server.a17_chat_service import A17ChatService
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -20,10 +21,20 @@ class CollaborationServer:
     def __init__(self, *, host: str = "127.0.0.1", tcp_port: int = 9000,
                  udp_port: int = 9001, cert: Path | None = None,
                  key: Path | None = None, registry: SessionRegistry | None = None,
-                 logger=print, on_udp_registered=None, on_session_closed=None) -> None:
+                 logger=print, on_udp_registered=None, on_session_closed=None,
+                 send_reliable_control=None, send_reliable_chat=None) -> None:
         self.registry = registry if registry is not None else SessionRegistry()
         self.logger = logger
         self.on_session_closed = on_session_closed
+        # A1.6 AUTH is DISABLED until B supplies a genuine reliable UDP stream-0
+        # sender. Never route AUTH over the TLS/bootstrap socket or raw UDP.
+        self.auth_service = (
+            A16AuthService(self.registry, send_reliable_control)
+            if send_reliable_control is not None else None
+        )
+        self.chat_service = None
+        if send_reliable_chat is not None:
+            self.attach_reliable_chat(send_reliable_chat)
         # A is the *only* consumer of Registry close events.
         self._cleanup_lock = threading.Lock()
         self.tls_context = server_context(cert or ROOT / 'certs/server.crt',
@@ -59,6 +70,43 @@ class CollaborationServer:
             if self.logger:
                 self.logger(f"[TLS] Rejected: {type(exc).__name__}")
 
+    def attach_reliable_control(self, send_reliable_control) -> None:
+        """A/B integration hook: B provides encrypted reliable stream-0 sender.
+
+        Configure before accepting stream callbacks. Do not connect a raw UDP
+        sendto or a TLS socket to this hook.
+        """
+        if self.auth_service is not None:
+            raise RuntimeError("Reliable control sender is already attached")
+        self.auth_service = A16AuthService(self.registry, send_reliable_control)
+
+    def attach_reliable_chat(self, send_reliable_chat) -> None:
+        """B supplies reliable encrypted stream-1 enqueue sender.
+
+        AUTH/stream-0 must be attached first so chat ERROR can use control.
+        """
+        if self.auth_service is None:
+            raise RuntimeError("Attach reliable control stream 0 before chat")
+        if self.chat_service is not None:
+            raise RuntimeError("Reliable chat sender is already attached")
+        self.chat_service = A17ChatService(
+            self.registry, send_reliable_chat,
+            self.auth_service.send_application_error,
+        )
+
+    def on_reliable_stream_data(self, conn_id: int, stream_id: int,
+                                offset: int, data: bytes, fin: bool = False) -> bool:
+        """B calls ONLY after verified, reassembled, in-order reliable DATA."""
+        if stream_id == 0:
+            if self.auth_service is None:
+                raise RuntimeError("B's reliable encrypted stream-0 transport is not attached")
+            return self.auth_service.on_stream_data(conn_id, stream_id, offset, data, fin)
+        if stream_id == 1:
+            if self.chat_service is None:
+                raise RuntimeError("B's reliable encrypted stream-1 transport is not attached")
+            return self.chat_service.on_stream_data(conn_id, stream_id, offset, data, fin)
+        raise ValueError("File stream_id >=2 is not integrated yet")
+
     def dispatch_closed_events(self) -> None:
         """A coordinator is sole owner of the Registry close-event queue.
 
@@ -73,6 +121,18 @@ class CollaborationServer:
         # Application/presence callbacks run outside both Registry and
         # transport/coordinator locks (can trigger new lifecycle actions).
         for event in events:
+            if self.chat_service is not None:
+                try:
+                    self.chat_service.on_session_closed(event)
+                except Exception as exc:
+                    if self.logger:
+                        self.logger(f"[CHAT] on_session_closed failed: {type(exc).__name__}")
+            if self.auth_service is not None:
+                try:
+                    self.auth_service.on_session_closed(event)
+                except Exception as exc:
+                    if self.logger:
+                        self.logger(f"[AUTH] on_session_closed failed: {type(exc).__name__}")
             if self.logger:
                 self.logger(f"[SESSION] CLOSED conn_id={event.conn_id:016x} reason={event.reason}")
             if self.on_session_closed:
