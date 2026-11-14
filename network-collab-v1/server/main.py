@@ -1,0 +1,300 @@
+"""Live server: TLS bootstrap, reliable UDP dispatch, authentication and chat."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import socket
+import ssl
+import threading
+
+from common.control_framing import ProtocolError
+from common.tls import server_context
+from server.bootstrap import handle_bootstrap
+from server.transfers import FileRelay
+from server.sessions import SessionRegistry, SessionClosedEvent
+from server.udp_service import UDPTransportService
+from server.a16_auth_service import A16AuthService
+from server.a17_chat_service import A17ChatService
+from server.reliable_dispatcher import bind_application_bridge
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class CollaborationServer:
+    def __init__(
+        self,
+        *,
+        host: str = "127.0.0.1",
+        tcp_port: int = 9000,
+        udp_port: int = 9001,
+        cert: Path | None = None,
+        key: Path | None = None,
+        registry: SessionRegistry | None = None,
+        logger=print,
+        on_udp_registered=None,
+        on_session_closed=None,
+        send_reliable_control=None,
+        send_reliable_chat=None,
+        enable_reliable_bridge: bool = True,
+    ) -> None:
+        self.registry = registry if registry is not None else SessionRegistry()
+        self.logger = logger
+        self.on_session_closed = on_session_closed
+        # The B4.4.2 bridge attaches real reliable senders after UDP init.
+        # Never route AUTH via the TLS/bootstrap socket or raw UDP.
+        self.auth_service = (
+            A16AuthService(self.registry, send_reliable_control)
+            if send_reliable_control is not None
+            else None
+        )
+        self.chat_service = None
+        if send_reliable_chat is not None:
+            self.attach_reliable_chat(send_reliable_chat)
+        # A is the *only* consumer of Registry close events.
+        self._cleanup_lock = threading.Lock()
+        self.tls_context = server_context(
+            cert or ROOT / "certs/server.crt", key or ROOT / "certs/server.key"
+        )
+        self.stop_event = threading.Event()
+        self._client_threads: list[threading.Thread] = []
+        self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self.tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.tcp_sock.bind((host, tcp_port))
+            self.tcp_sock.listen(20)
+            self.tcp_sock.settimeout(0.1)
+            self.udp_service = UDPTransportService(
+                self.registry,
+                host=host,
+                port=udp_port,
+                logger=logger,
+                on_udp_registered=on_udp_registered,
+                auto_drive=enable_reliable_bridge,
+            )
+        except Exception:
+            self.tcp_sock.close()
+            raise
+        self.tcp_port = self.tcp_sock.getsockname()[1]
+        self.udp_port = self.udp_service.port
+        # B4.4.2 application dispatch happens on dedicated transport workers.
+        self.delivery_dispatcher = (
+            bind_application_bridge(
+                self,
+                on_reliable_delivery_failed=self.on_reliable_delivery_failed,
+            )
+            if enable_reliable_bridge
+            else None
+        )
+
+        self.files = FileRelay(self.registry, self.udp_service)
+        if self.auth_service:
+            self.auth_service.file_control = self.files.control
+
+    def on_reliable_delivery_failed(
+        self, conn_id: int, stream_id: int, offset: int, code: str
+    ) -> None:
+        """A policy: fail-close, with close-event draining only at coordinator."""
+        if self.logger:
+            self.logger(
+                f"[APP] delivery failure conn_id={conn_id:016x} "
+                f"stream_id={stream_id} offset={offset} code={code}"
+            )
+        self.registry.close(conn_id, reason="app_delivery_failure")
+
+    def _handle_tls(self, raw: socket.socket, peer: tuple[str, int]) -> None:
+        try:
+            with raw:
+                raw.settimeout(5)
+                with self.tls_context.wrap_socket(raw, server_side=True) as tls_sock:
+                    session = handle_bootstrap(
+                        tls_sock,
+                        registry=self.registry,
+                        udp_port=self.udp_port,
+                        peer_ip=peer[0],
+                    )
+                    if self.logger:
+                        self.logger(
+                            f"[TLS] BOOTSTRAPPED conn_id={session.conn_id:016x}"
+                        )
+        except (
+            ssl.SSLError,
+            ProtocolError,
+            OSError,
+            ValueError,
+            ConnectionError,
+        ) as exc:
+            if self.logger:
+                self.logger(f"[TLS] Rejected: {type(exc).__name__}")
+
+    def attach_reliable_control(self, send_reliable_control) -> None:
+        """A/B integration hook: B provides encrypted reliable stream-0 sender.
+
+        Configure before accepting stream callbacks. Do not connect a raw UDP
+        sendto or a TLS socket to this hook.
+        """
+        if self.auth_service is not None:
+            raise RuntimeError("Reliable control sender is already attached")
+        self.auth_service = A16AuthService(self.registry, send_reliable_control)
+
+    def attach_reliable_chat(self, send_reliable_chat) -> None:
+        """B supplies reliable encrypted stream-1 enqueue sender.
+
+        AUTH/stream-0 must be attached first so chat ERROR can use control.
+        """
+        if self.auth_service is None:
+            raise RuntimeError("Attach reliable control stream 0 before chat")
+        if self.chat_service is not None:
+            raise RuntimeError("Reliable chat sender is already attached")
+        self.chat_service = A17ChatService(
+            self.registry,
+            send_reliable_chat,
+            self.auth_service.send_application_error,
+        )
+
+    def on_reliable_stream_data(
+        self, conn_id: int, stream_id: int, offset: int, data: bytes, fin: bool = False
+    ) -> bool:
+        """B calls ONLY after verified, reassembled, in-order reliable DATA."""
+        if stream_id == 0:
+            if self.auth_service is None:
+                raise RuntimeError(
+                    "B's reliable encrypted stream-0 transport is not attached"
+                )
+            return self.auth_service.on_stream_data(
+                conn_id, stream_id, offset, data, fin
+            )
+        if stream_id == 1:
+            if self.chat_service is None:
+                raise RuntimeError(
+                    "B's reliable encrypted stream-1 transport is not attached"
+                )
+            return self.chat_service.on_stream_data(
+                conn_id, stream_id, offset, data, fin
+            )
+        return self.files.relay(conn_id, stream_id, offset, data, fin)
+
+    def dispatch_closed_events(self) -> None:
+        """A coordinator is sole owner of the Registry close-event queue.
+
+        Drain once, remove B transport state, then notify A application/presence.
+        No Registry lock is held while calling transport or callbacks.
+        """
+        with self._cleanup_lock:
+            self.registry.cleanup_expired()
+            events = self.registry.drain_closed_events()
+            for event in events:
+                self.udp_service.remove_connection(event.conn_id)
+        # Application/presence callbacks run outside both Registry and
+        # transport/coordinator locks (can trigger new lifecycle actions).
+        for event in events:
+            notice = self.files.closed(event.conn_id)
+            if notice and self.auth_service:
+                peer, body = notice
+                self.auth_service._message(peer, "FILE_RESULT", body)
+            if self.chat_service is not None:
+                try:
+                    self.chat_service.on_session_closed(event)
+                except Exception as exc:
+                    if self.logger:
+                        self.logger(
+                            f"[CHAT] on_session_closed failed: {type(exc).__name__}"
+                        )
+            if self.auth_service is not None:
+                try:
+                    self.auth_service.on_session_closed(event)
+                except Exception as exc:
+                    if self.logger:
+                        self.logger(
+                            f"[AUTH] on_session_closed failed: {type(exc).__name__}"
+                        )
+            if self.logger:
+                self.logger(
+                    f"[SESSION] CLOSED conn_id={event.conn_id:016x} reason={event.reason}"
+                )
+            if self.on_session_closed:
+                try:
+                    self.on_session_closed(event)
+                except Exception as exc:
+                    if self.logger:
+                        self.logger(
+                            f"[SESSION] on_session_closed failed: {type(exc).__name__}"
+                        )
+
+    def serve_forever(self) -> None:
+        if self.logger:
+            self.logger(f"[SERVER] TLS TCP :{self.tcp_port}, UDP :{self.udp_port}")
+        udp_thread = threading.Thread(
+            target=self.udp_service.serve_forever, daemon=True
+        )
+        udp_thread.start()
+        try:
+            if self.delivery_dispatcher is not None:
+                self.delivery_dispatcher.start()
+            while not self.stop_event.is_set():
+                try:
+                    raw, peer = self.tcp_sock.accept()
+                except socket.timeout:
+                    self.dispatch_closed_events()
+                    continue
+                except OSError:
+                    if self.stop_event.is_set():
+                        break
+                    raise
+                t = threading.Thread(
+                    target=self._handle_tls, args=(raw, peer), daemon=True
+                )
+                t.start()
+                self._client_threads.append(t)
+                self.dispatch_closed_events()
+        finally:
+            self.stop()
+            udp_thread.join(timeout=2)
+            for t in self._client_threads:
+                t.join(timeout=1)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.delivery_dispatcher is not None:
+            self.delivery_dispatcher.stop()
+        self.tcp_sock.close()
+        self.udp_service.stop()
+        self.dispatch_closed_events()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="TLS + Reliable UDP AUTH/Chat server")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--tcp-port", type=int, default=9000)
+    parser.add_argument("--udp-port", type=int, default=9001)
+    parser.add_argument("--cert", type=Path, default=ROOT / "certs/server.crt")
+    parser.add_argument("--key", type=Path, default=ROOT / "certs/server.key")
+    parser.add_argument(
+        "--idle-timeout-s",
+        type=float,
+        default=10.0,
+        help="Default 10 s per protocol; increase ONLY for manual demo until B adds heartbeat",
+    )
+    args = parser.parse_args()
+    if args.idle_timeout_s <= 0:
+        parser.error("--idle-timeout-s must be positive")
+    if args.idle_timeout_s != 10.0:
+        print(
+            "[DEMO WARNING] Non-standard idle timeout; protocol requires 10s + heartbeat"
+        )
+    srv = CollaborationServer(
+        host=args.host,
+        tcp_port=args.tcp_port,
+        udp_port=args.udp_port,
+        cert=args.cert,
+        key=args.key,
+        registry=SessionRegistry(idle_timeout_s=args.idle_timeout_s),
+    )
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        srv.stop()
+
+
+if __name__ == "__main__":
+    main()

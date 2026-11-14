@@ -1,0 +1,43 @@
+"""Shared protocol constants; keep wire values synchronized across client/server."""
+
+# Giữ tên từ starter cũ để control_framing.py + 10 unit tests tương thích.
+PROTOCOL_VERSION = 1
+MAX_CONTROL_FRAME = 65536
+CONTROL_PORT = 9000
+
+# Shared defaults and application limits. The GUI entry point defaults to 8000.
+UDP_PORT = 9001
+UI_PORT = 8765
+MAX_UDP_DATAGRAM = 1200
+MAX_STREAM_CHUNK = 1024
+STREAM_CONTROL = 0
+STREAM_CHAT = 1
+FILE_STREAM_MIN_ID = 2
+MAX_FILE_SIZE = 50 * 1024 * 1024
+
+# UDP wire format, encryption and packet types.
+MAGIC = 0x4E43
+WIRE_VERSION = 1
+HEADER_SIZE = 20
+GCM_TAG_SIZE = 16
+MAX_DATA_PER_PACKET = 1024
+AES_256_KEY_SIZE = 32
+REPLAY_WINDOW_SIZE = 4096
+REGISTER = 0x01
+REGISTER_OK = 0x02
+DATA = 0x10
+ACK = 0x11
+WINDOW_UPDATE = 0x12
+PING = 0x20
+PONG = 0x21
+CLOSE = 0x30
+VALID_PACKET_TYPES = frozenset(
+    {REGISTER, REGISTER_OK, DATA, ACK, WINDOW_UPDATE, PING, PONG, CLOSE}
+)
+
+CONTROL_CHAT_INITIAL_WINDOW = 64 * 1024
+FILE_INITIAL_WINDOW = 512 * 1024
+# Congestion accounting uses protocol datagram bytes, excluding IP/UDP headers.
+DATA_METADATA_SIZE = 15
+DATA_DATAGRAM_OVERHEAD = HEADER_SIZE + DATA_METADATA_SIZE + GCM_TAG_SIZE
+MAX_DATA_DATAGRAM_BYTES = DATA_DATAGRAM_OVERHEAD + MAX_DATA_PER_PACKET

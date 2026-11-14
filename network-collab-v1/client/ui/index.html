@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Collab — Secure Workspace</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="site-shell">
+    <header class="topbar">
+      <div class="brand" aria-label="Collab Workspace">
+        <div class="brand-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h9M5 17h14" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg></div>
+        <div class="brand-name">collab<span class="brand-period">.</span></div>
+        <span class="brand-tag">workspace</span>
+      </div>
+      <div class="top-actions">
+        <span class="privacy-pill"><span class="lock-symbol" aria-hidden="true">◆</span> LOCAL WEB INTERFACE</span>
+        <span class="conn-pill" id="connectionBadge"><span class="status-dot"></span><span id="connectionText">Chưa kết nối</span></span>
+      </div>
+    </header>
+
+    <section id="resilienceBanner" class="resilience-banner" role="alert" aria-live="assertive" hidden>
+      <span class="resilience-symbol" aria-hidden="true">!</span>
+      <div class="resilience-copy"><strong id="resilienceTitle">Kết nối gián đoạn</strong>
+        <p id="resilienceMessage">Không thể liên hệ với ứng dụng.</p></div>
+      <button id="retryBridgeButton" type="button" class="resilience-retry">Kiểm tra lại</button>
+    </section>
+
+    <main id="loginView" class="login-grid">
+      <section class="intro-panel" aria-labelledby="introTitle">
+        <div class="eyebrow"><span class="eyebrow-line"></span> PRIVATE TEAM COMMUNICATION</div>
+        <h1 id="introTitle">Ở cùng một nhịp.<br><span>Trao đổi liền mạch.</span></h1>
+        <p class="intro-copy">Không gian làm việc dành cho nhóm của bạn. Đăng nhập để kết nối an toàn, theo dõi thành viên online và trò chuyện cùng nhau.</p>
+        <div class="feature-stack">
+          <div class="feature"><span class="feature-icon">01</span><div><strong>Tin nhắn trực tiếp</strong><small>Liên lạc riêng với từng thành viên</small></div></div>
+          <div class="feature"><span class="feature-icon">02</span><div><strong>Nhóm luôn đồng bộ</strong><small>Biết ai đang trực tuyến theo thời gian thực</small></div></div>
+          <div class="feature"><span class="feature-icon">03</span><div><strong>Kết nối bảo vệ</strong><small>TLS bootstrap + Reliable UDP mã hóa</small></div></div>
+        </div>
+        <div class="intro-footer"><span class="sparkle">✳</span> Built for real-time collaboration</div>
+      </section>
+
+      <section class="form-wrap" aria-labelledby="loginTitle">
+        <div class="login-card">
+          <div class="card-overline">CHÀO MỪNG TRỞ LẠI</div>
+          <h2 id="loginTitle">Đăng nhập</h2>
+          <p class="card-help">Sử dụng tài khoản do server cấp để bắt đầu phiên làm việc.</p>
+          <form id="loginForm" novalidate>
+            <label for="username">Tên đăng nhập</label>
+            <div class="field"><span class="field-symbol" aria-hidden="true">@</span><input id="username" name="username" type="text" autocomplete="username" maxlength="128" minlength="1" placeholder="Ví dụ: an" required></div>
+            <label for="password">Mật khẩu</label>
+            <div class="field"><span class="field-symbol" aria-hidden="true">●</span><input id="password" name="password" type="password" autocomplete="current-password" maxlength="1024" minlength="1" placeholder="Nhập mật khẩu" required><button type="button" class="reveal" id="revealPassword" aria-label="Hiện mật khẩu">Hiện</button></div>
+            <p id="formError" class="form-error" role="alert" aria-live="polite" hidden></p>
+            <button class="primary-button" type="submit" id="loginButton"><span>Đăng nhập vào workspace</span><span aria-hidden="true">↗</span></button>
+          </form>
+          <div class="card-separator"><span>THÔNG TIN PHIÊN</span></div>
+          <div class="info-row"><span>Server TLS</span><code id="targetServer">127.0.0.1:9000</code></div>
+          <div class="info-row"><span>Kết nối</span><span>TLS + Encrypted UDP</span></div>
+          <p class="security-note">Trang này chỉ chạy trên máy của bạn. Thông tin đăng nhập được chuyển qua Python client để xác thực qua reliable UDP; trình duyệt không kết nối trực tiếp đến UDP server.</p>
+        </div>
+      </section>
+    </main>
+
+    <main id="workspaceView" class="workspace workspace-chat" hidden>
+      <aside class="sidebar chat-sidebar">
+        <div class="sidebar-heading"><span>TRÒ CHUYỆN</span><span class="mini-square">⌘</span></div>
+        <button class="chat-nav selected" type="button" id="globalChatButton" aria-current="page">
+          <span class="chat-nav-icon">#</span><span class="chat-nav-text"><strong>Global Chat</strong><small>Tất cả thành viên</small></span>
+          <span id="globalUnread" class="unread-badge" hidden>0</span>
+        </button>
+        <div class="section-title chat-section-title"><span>TIN NHẮN RIÊNG</span><span class="count" id="onlineCount">0</span></div>
+        <label class="chat-search"><span aria-hidden="true">⌕</span><input id="contactSearch" type="search" placeholder="Tìm thành viên..." aria-label="Tìm thành viên"></label>
+        <div class="member-list chat-members" id="membersList" aria-label="Danh sách hội thoại" aria-live="polite"></div>
+        <p class="sidebar-note">Tin nhắn lưu trong phiên trình duyệt hiện tại. Không phải lịch sử lưu trữ trên server.</p>
+        <div class="sidebar-footer"><div class="avatar" id="myAvatar">?</div><div class="profile-name"><strong id="myUsername">—</strong><span><span class="online-pin"></span> Đang trực tuyến</span></div><button id="logoutButton" class="icon-button" type="button" title="Đăng xuất" aria-label="Đăng xuất">↪</button></div>
+      </aside>
+      <section class="chat-workarea" aria-label="Khu vực nhắn tin">
+        <div class="chat-topline">
+          <div class="chat-titlegroup"><div class="chat-channel-icon" id="channelIcon">#</div><div><div class="work-eyebrow" id="channelEyebrow">KÊNH CHUNG</div><h2 id="channelTitle">Global Chat</h2><p id="channelSubtitle">Tin nhắn đến mọi thành viên đang online</p></div></div>
+          <div class="chat-topline-badge"><span class="online-pin"></span><span id="chatMemberCount">0 thành viên</span></div>
+        </div>
+        <div class="chat-messages" id="messageList" role="log" aria-live="polite" aria-relevant="additions">
+          <div class="chat-empty"><span class="chat-empty-icon">✦</span><strong>Không gian trò chuyện đã sẵn sàng</strong><p>Gửi tin đầu tiên để bắt đầu cuộc trò chuyện.</p></div>
+        </div>
+        <div class="composer-wrap">
+          <div id="chatNotice" class="chat-notice" role="status" aria-live="polite" hidden></div>
+          <form id="chatForm" class="chat-form">
+            <label for="messageInput" class="sr-only">Soạn tin nhắn</label>
+            <textarea id="messageInput" rows="2" placeholder="Nhập tin nhắn cho mọi người..." maxlength="1000" required></textarea>
+            <div class="composer-actions"><div class="composer-meta"><span>↵ Enter để gửi · Shift+Enter xuống dòng</span><span id="byteCounter">0 / 1000 bytes</span></div><button type="submit" id="sendButton" class="send-button"><span>Gửi tin</span><span aria-hidden="true">➤</span></button></div>
+          </form>
+          <details class="file-drawer" id="fileDrawer">
+            <summary><span aria-hidden="true">📎</span> Gửi / nhận tệp tin <span class="file-limit">Tối đa 50 MiB</span></summary>
+            <div class="file-drawer-body">
+              <form id="fileOfferForm" class="file-send-form">
+                <label for="fileRecipient">Gửi đến</label>
+                <select id="fileRecipient" required><option value="">Chọn người nhận</option></select>
+                <label for="fileInput">Chọn file (tối đa 50 MiB mỗi file)</label>
+                <input type="file" id="fileInput" multiple required>
+                <button type="submit" id="fileSendButton" class="file-action">Gửi yêu cầu nhận file</button>
+              </form>
+              <p class="file-note">Có thể chọn nhiều file. Các file được gửi lần lượt cho người đã chọn và cần được chấp nhận từng file. Tiến độ nhận tính bằng byte thực tế; tiến độ phía gửi chỉ xác nhận hoàn tất khi có FILE_RESULT.</p>
+              <div class="file-activity" id="fileActivity" aria-live="polite"></div>
+            </div>
+          </details>
+          <div class="chat-privacy">🔒 Tin nhắn và file truyền qua Reliable UDP mã hóa · Mỗi file tối đa 50 MiB</div>
+        </div>
+      </section>
+      <aside class="chat-detail" aria-label="Thông tin phiên">
+        <div class="detail-eyebrow">KẾT NỐI CỦA BẠN</div>
+        <div class="detail-illustration"><span>◉</span><span class="detail-orbit dot-a"></span><span class="detail-orbit dot-b"></span></div>
+        <h3>Đang kết nối an toàn</h3>
+        <p>Phiên sử dụng TLS Bootstrap và AES-256-GCM trên Reliable UDP.</p>
+        <div class="detail-separator"></div>
+        <div class="detail-item"><span>Trạng thái</span><strong id="sessionState">Online</strong></div>
+        <div class="detail-item"><span>Thành viên online</span><strong id="statOnline">0</strong></div>
+        <div class="detail-item"><span>Máy chủ</span><strong id="currentServer">127.0.0.1</strong></div>
+        <div class="detail-tip"><span>✧</span><p>Chọn một người trong danh sách bên trái để chat riêng hoặc dùng Global Chat để gửi tới cả nhóm.</p></div>
+      </aside>
+    </main>
+    <footer class="site-footer"><span>CO3094 · Distributed Collaboration</span><span>Application UI · GUI-5 · Resilience</span></footer>
+  </div>
+</body>
+</html>
