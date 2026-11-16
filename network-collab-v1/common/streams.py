@@ -388,24 +388,6 @@ class StreamSendState:
 
 
 class StreamManager:
-    """Bounded, per-connection collection of independent logical streams.
-
-    This is an INTERNAL B2.3 interface, not yet the agreed A/B transport ABI.
-    One instance belongs to exactly one UDP connection (ConnID); B3 must
-    serialize access to it. Control (0) and chat (1) exist at creation; file
-    streams (>=2) are opened explicitly by the FILE_START integration path.
-
-    Each stream has separate send and receive offset spaces. No UDP packet
-    numbers, ACK/retransmit tracker, registry access, callbacks, I/O, socket,
-    or CUBIC logic lives here. Returning a StreamDelivery does NOT mean that
-    the application worker accepted it. B3 must retain/hand off deliveries
-    safely and call A's callbacks outside transport locks.
-
-    Limits below are provisional *local resource policy*, NOT negotiated or
-    defined as wire-format values in the proposed protocol. In-flight DATA
-    metadata and outstanding app callbacks must be bounded separately by B3.
-    """
-
     def __init__(
         self,
         conn_id: int,
@@ -537,11 +519,6 @@ class StreamManager:
         return True
 
     def queue_bytes(self, stream_id: int, data: bytes, *, fin: bool = False) -> None:
-        """Enqueue raw stream bytes, no JSON framing or UDP I/O.
-
-        A's already-framed stream-0 AUTH/control bytes pass through unchanged.
-        On overflow, no part of the new DATA or FIN is committed.
-        """
         state = self._send_state(stream_id)
         if not isinstance(data, bytes):
             raise TypeError("stream send payload must be bytes")

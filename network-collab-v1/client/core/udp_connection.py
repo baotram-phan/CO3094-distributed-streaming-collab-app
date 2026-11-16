@@ -48,16 +48,6 @@ class UDPRegistrationClient:
         bind_host: str = "0.0.0.0",
         bootstrap_deadline: float | None = None,
     ) -> None:
-        """bootstrap_deadline: absolute time.monotonic() deadline (seconds).
-
-        To respect the server's 10-second BOOTSTRAPPED deadline, the caller
-        should calculate it *before* beginning TLS bootstrap, e.g.:
-            started = time.monotonic()
-            session = bootstrap(...)
-            client = UDPRegistrationClient(..., bootstrap_deadline=started + 10)
-        If omitted, the client uses a 10-second cap from construction; this
-        cannot account for time already spent in the preceding TLS bootstrap.
-        """
         if type(udp_port) is not int or not (1 <= udp_port <= 65535):
             raise ValueError("udp_port must be between 1 and 65535")
         if not isinstance(c2s_key, bytes) or len(c2s_key) != 32:
@@ -102,12 +92,6 @@ class UDPRegistrationClient:
         return self.sock.getsockname()
 
     def register(self, *, attempts: int = 10, wait_s: float = 0.5) -> tuple[str, int]:
-        """Send new authenticated REGISTER each retry, verify REGISTER_OK.
-
-        Never sends after bootstrap_deadline.  A positive attempt count and
-        timeout are required.  A valid delayed reply to an earlier attempt is
-        still acceptable; server packet-number replay protection applies.
-        """
         if self._closed:
             raise RuntimeError("UDP socket is closed; bootstrap again")
         if self.registered:

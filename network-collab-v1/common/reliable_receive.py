@@ -227,12 +227,6 @@ class ReliableReceiveState:
         bound_endpoint: tuple[str, int],
         now_ms: float,
     ) -> ReceiveResult | None:
-        """Validate endpoint, AEAD, anti-replay, body and bounded acceptance.
-
-        Invalid packets never consume replay numbers or receive credit.
-        The caller checks live session/tombstone before entering this method.
-        All transport calls must be serialized per ConnID.
-        """
         if endpoint != bound_endpoint:
             return None
         if not isinstance(packet, bytes) or not (

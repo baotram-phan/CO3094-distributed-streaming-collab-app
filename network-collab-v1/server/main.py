@@ -155,7 +155,6 @@ class CollaborationServer:
     def on_reliable_stream_data(
         self, conn_id: int, stream_id: int, offset: int, data: bytes, fin: bool = False
     ) -> bool:
-        """B calls ONLY after verified, reassembled, in-order reliable DATA."""
         if stream_id == 0:
             if self.auth_service is None:
                 raise RuntimeError(
@@ -175,11 +174,6 @@ class CollaborationServer:
         return self.files.relay(conn_id, stream_id, offset, data, fin)
 
     def dispatch_closed_events(self) -> None:
-        """A coordinator is sole owner of the Registry close-event queue.
-
-        Drain once, remove B transport state, then notify A application/presence.
-        No Registry lock is held while calling transport or callbacks.
-        """
         with self._cleanup_lock:
             self.registry.cleanup_expired()
             events = self.registry.drain_closed_events()

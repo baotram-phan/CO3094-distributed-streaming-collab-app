@@ -1,20 +1,3 @@
-"""B3.1: bounded ACK tracking for one encrypted UDP connection.
-
-Protocol v1.0-proposed §4.2, §6. This is deliberately *state only*:
-no socket calls, no retransmission, no RTT/RTO, no callbacks, no CUBIC.
-
-IMPORTANT receive integration ordering:
-    source endpoint + header + AES-GCM + body validation -> ReplayWindow.commit
-    -> accept DATA into bounded stream/reliable delivery state
-    -> ReceivedPacketAckTracker.note_received() (only after safe acceptance).
-An authenticated duplicate MAY use request_reack() but MUST NEVER be
-replayed into stream/application logic. ACK-only packets are never ACKed.
-
-One ConnectionAckState belongs to ONE conn_id and ONE local endpoint; the
-caller serializes access per ConnID. No Registry/callback activity inside here.
-Internal B API; integration ABI still awaits A/B approval.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -71,12 +54,6 @@ def _packet_type(value: int) -> None:
 
 @dataclass(frozen=True, slots=True)
 class SentPacket:
-    """ACK-eliciting packet retained until ACK or explicitly canceled.
-
-    `frame` owns the original DATA stream identity for B3.2 retransmission:
-    a resend must use a NEW packet number with the SAME stream frame.
-    """
-
     packet_num: int
     packet_type: int
     sent_at_ms: float
@@ -103,16 +80,6 @@ class AckReceipt:
 
 
 class SentPacketTracker:
-    """Bounded send metadata for one ConnID; never allocates packet numbers.
-
-    Call `track_sent()` immediately after packet-number allocation but BEFORE
-    the packet can be lost by the send path; `cancel_sent()` on a definite
-    send failure. Caller must serialize sends in allocated packet-number order.
-    For DATA, do not pop the B2 frame unless there is tracking capacity or a
-    separate bounded staging queue guarantees that the frame cannot be lost.
-    B3.2 will implement retry/loss accounting and CUBIC events.
-    """
-
     def __init__(
         self,
         *,
@@ -481,18 +448,6 @@ class ConnectionAckState:
 
 
 class RttEstimator:
-    """One sender-side RTT/RTO estimator per connection, with no UDP I/O.
-
-    Accept *only* a packet's first newly authenticated ACK as an RTT sample:
-    `SentPacketTracker.process_ack()` supplies `AckReceipt.newly_acked`.
-    B3.2.2 must call `on_timeout()` only when an actual timer fires.
-
-    All times use the SAME monotonic clock in milliseconds. `ack_delay_ms`
-    comes from an authenticated ACK and is capped at the protocol's 25 ms;
-    adjustments never make the sample negative. This is an internal B API,
-    not an agreed callback interface with A.
-    """
-
     def __init__(self) -> None:
         self.smoothed_rtt_ms: float | None = None
         self.rttvar_ms: float | None = None

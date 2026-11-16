@@ -56,6 +56,11 @@ class ScalabilityResult:
     broadcast_fanout_seconds: float
     idle_seconds: float
     errors: int = 0
+    disconnected_clients: int = 0
+    remaining_online_after_disconnect: int = 0
+    offline_notifications_received: int = 0
+    post_disconnect_chat_delivered: int = 0
+    broadcast_deliveries_received: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -84,7 +89,7 @@ def run_scalability_scenario(
     login_workers: int | None = None,
     idle_seconds: float = 0.0,
 ) -> ScalabilityResult:
-    """Exercise N simultaneously ONLINE clients and N direct + N broadcast deliveries.
+    """Exercise N ONLINE clients, chat/heartbeat, then disconnect half concurrently.
 
     Raises AssertionError/other exceptions on failure, never silently retries
     application messages. This test intentionally uses default 10-second idle
@@ -183,20 +188,31 @@ def run_scalability_scenario(
                     assert event["body"]["from"] == expected_sender
                     direct_latencies.append(time.monotonic() - direct_send_at[sender_index])
 
-                # Server-side broadcast should reach ALL clients (incl. sender).
+                # Each client broadcasts once; every message must reach ALL
+                # clients (including its sender), for N*N received deliveries.
                 fanout_start = time.monotonic()
-                clients[0].send_broadcast("benchmark-global-unique")
+                broadcasts = {
+                    username: f"benchmark-global:{index}"
+                    for index, username in enumerate(usernames)
+                }
+                for username, client in zip(usernames, clients):
+                    client.send_broadcast(broadcasts[username])
                 fanout_deadline = fanout_start + 18.0
+                broadcast_deliveries = 0
                 for receiver in clients:
-                    event = _next_message(
-                        receiver,
-                        lambda e: e.get("type") == "CHAT_EVENT"
-                            and e.get("body", {}).get("from") == usernames[0]
-                            and e.get("body", {}).get("text") == "benchmark-global-unique"
-                            and e.get("body", {}).get("scope") == "broadcast",
-                        deadline=fanout_deadline,
-                    )
-                    assert event["body"]["from"] == usernames[0]
+                    pending_broadcasts = dict(broadcasts)
+                    while pending_broadcasts:
+                        event = _next_message(
+                            receiver,
+                            lambda e: e.get("type") == "CHAT_EVENT"
+                                and e.get("body", {}).get("from") in pending_broadcasts
+                                and e.get("body", {}).get("text")
+                                    == pending_broadcasts.get(e.get("body", {}).get("from"))
+                                and e.get("body", {}).get("scope") == "broadcast",
+                            deadline=fanout_deadline,
+                        )
+                        del pending_broadcasts[event["body"]["from"]]
+                        broadcast_deliveries += 1
                 fanout_elapsed = time.monotonic() - fanout_start
 
                 # Idle check includes >10s default idle timeout for 20 clients.
@@ -229,6 +245,58 @@ def run_scalability_scenario(
                     )
                     post_idle_delivered = 1
 
+                # Stop half the actual clients together. No server-side close,
+                # fake clock or longer idle timeout: cleanup must happen naturally.
+                drop_count = number_of_clients // 2
+                dropped = clients[:drop_count]
+                survivors = clients[drop_count:]
+                drop_barrier = threading.Barrier(drop_count)
+
+                def disconnect(client: CollaborationClient) -> None:
+                    drop_barrier.wait(timeout=5.0)
+                    client.close()
+
+                with ThreadPoolExecutor(max_workers=drop_count) as pool:
+                    futures = [pool.submit(disconnect, client) for client in dropped]
+                    for future in futures:
+                        future.result(timeout=8.0)
+
+                pending_offline = set(usernames[:drop_count])
+                offline_deadline = time.monotonic() + server.registry.idle_timeout_s + 8.0
+                while pending_offline:
+                    event = _next_message(
+                        survivors[-1],
+                        lambda e: e.get("type") == "PRESENCE"
+                            and e.get("body", {}).get("status") == "offline"
+                            and e.get("body", {}).get("username") in pending_offline,
+                        deadline=offline_deadline,
+                    )
+                    pending_offline.remove(event["body"]["username"])
+
+                remaining_online = server.registry.list_online_users()
+                assert set(remaining_online) == set(usernames[drop_count:]), (
+                    f"Wrong ONLINE users after disconnect: {remaining_online}"
+                )
+                assert server.udp_service.connection_ids() == {
+                    client.conn_id for client in survivors
+                }, "Transport state must contain only surviving clients"
+                for client in dropped:
+                    assert server.registry.get(client.conn_id) is None
+                    assert server.udp_service.get_reliable_receiver(client.conn_id) is None
+                for client in survivors:
+                    assert client.failure is None, f"Survivor failed: {client.failure!r}"
+                    assert not client._stop.is_set(), "Surviving client stopped"
+
+                survivors[0].send_direct(usernames[-1], "after-concurrent-disconnect")
+                _next_message(
+                    survivors[-1],
+                    lambda e: e.get("type") == "CHAT_EVENT"
+                        and e.get("body", {}).get("from") == usernames[drop_count]
+                        and e.get("body", {}).get("text") == "after-concurrent-disconnect"
+                        and e.get("body", {}).get("scope") == "direct",
+                    deadline=time.monotonic() + 8.0,
+                )
+
                 result = ScalabilityResult(
                     clients=number_of_clients,
                     concurrent_login_workers=workers,
@@ -245,6 +313,11 @@ def run_scalability_scenario(
                     direct_p95_ms=_percentile_ms(direct_latencies, 0.95),
                     broadcast_fanout_seconds=round(fanout_elapsed, 3),
                     idle_seconds=idle_seconds,
+                    disconnected_clients=drop_count,
+                    remaining_online_after_disconnect=len(remaining_online),
+                    offline_notifications_received=drop_count,
+                    post_disconnect_chat_delivered=1,
+                    broadcast_deliveries_received=broadcast_deliveries,
                 )
                 print("[SCALABILITY] " + json.dumps(result.to_dict(), sort_keys=True),
                       flush=True)
